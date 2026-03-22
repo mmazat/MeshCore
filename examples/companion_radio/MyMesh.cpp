@@ -581,21 +581,41 @@ void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packe
           strncpy(sender_name, "Unknown", sizeof(sender_name));
         }
 
-        // Check if the message body is exactly "test" (case-insensitive, allow trailing spaces)
-        bool is_test = (msg_body[0] == 't' || msg_body[0] == 'T') &&
-                       (msg_body[1] == 'e' || msg_body[1] == 'E') &&
-                       (msg_body[2] == 's' || msg_body[2] == 'S') &&
-                       (msg_body[3] == 't' || msg_body[3] == 'T');
+        // Check if the message body is exactly "pathbot" (case-insensitive, allow trailing spaces)
+        bool is_test = (msg_body[0] == 'p' || msg_body[0] == 'P') &&
+                       (msg_body[1] == 'a' || msg_body[1] == 'A') &&
+                       (msg_body[2] == 't' || msg_body[2] == 'T') &&
+                       (msg_body[3] == 'h' || msg_body[3] == 'H') &&
+                       (msg_body[4] == 'b' || msg_body[4] == 'B') &&
+                       (msg_body[5] == 'o' || msg_body[5] == 'O') &&
+                       (msg_body[6] == 't' || msg_body[6] == 'T');
         if (is_test) {
-          // Only allow trailing spaces or end of string
-          const char *tail = &msg_body[4];
+          const char *tail = &msg_body[7];
           while (*tail == ' ') tail++;
           if (*tail != '\0') is_test = false;
         }
 
         if (is_test && strcmp(sender_name, getNodeName()) != 0) {
+          // Build path info string: hop count and repeater hash prefixes
+          uint8_t hop_count = pkt->isRouteFlood() ? pkt->getPathHashCount() : 0;
+          uint8_t hash_size = pkt->getPathHashSize();
+          char path_str[128];
+          int pos = 0;
+
+          if (hop_count == 0) {
+            pos = snprintf(path_str, sizeof(path_str), "direct");
+          } else {
+            pos = snprintf(path_str, sizeof(path_str), "%d-hop", hop_count);
+            for (int h = 0; h < hop_count && pos < (int)sizeof(path_str) - 8; h++) {
+              const uint8_t *hop_hash = &pkt->path[h * hash_size];
+              // Show first byte as 2 hex chars (e.g. "c0", "x5")
+              pos += snprintf(&path_str[pos], sizeof(path_str) - pos, "%s%02x",
+                              (h == 0) ? " " : "\xe2\x86\x92", hop_hash[0]);
+            }
+          }
+
           char reply_text[MAX_TEXT_LEN];
-          snprintf(reply_text, sizeof(reply_text), "Hey %s, I got your test message!", sender_name);
+          snprintf(reply_text, sizeof(reply_text), "@%s %s", sender_name, path_str);
 
           uint32_t now = getRTCClock()->getCurrentTime();
           sendGroupMessage(now, ch_details.channel, getNodeName(), reply_text, strlen(reply_text));
