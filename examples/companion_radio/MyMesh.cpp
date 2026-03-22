@@ -596,7 +596,40 @@ void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packe
         if (is_test && strcmp(sender_name, getNodeName()) != 0) {
           char reply_text[MAX_TEXT_LEN];
           snprintf(reply_text, sizeof(reply_text), "Hey %s, I got your test message!", sender_name);
-          sendGroupMessage(getRTCClock()->getCurrentTime(), ch_details.channel, getNodeName(), reply_text, strlen(reply_text));
+
+          uint32_t now = getRTCClock()->getCurrentTime();
+          sendGroupMessage(now, ch_details.channel, getNodeName(), reply_text, strlen(reply_text));
+
+          // Also queue the reply locally so it shows in the companion app
+          {
+            char full_reply[MAX_TEXT_LEN + 32];
+            snprintf(full_reply, sizeof(full_reply), "%s: %s", getNodeName(), reply_text);
+            int ri = 0;
+            if (app_target_ver >= 3) {
+              out_frame[ri++] = RESP_CODE_CHANNEL_MSG_RECV_V3;
+              out_frame[ri++] = 0; // SNR (local)
+              out_frame[ri++] = 0; // reserved1
+              out_frame[ri++] = 0; // reserved2
+            } else {
+              out_frame[ri++] = RESP_CODE_CHANNEL_MSG_RECV;
+            }
+            out_frame[ri++] = channel_idx;
+            out_frame[ri++] = 0xFF; // path_len = direct
+            out_frame[ri++] = TXT_TYPE_PLAIN;
+            memcpy(&out_frame[ri], &now, 4);
+            ri += 4;
+            int rlen = strlen(full_reply);
+            if (ri + rlen > MAX_FRAME_SIZE) rlen = MAX_FRAME_SIZE - ri;
+            memcpy(&out_frame[ri], full_reply, rlen);
+            ri += rlen;
+            addToOfflineQueue(out_frame, ri);
+
+            if (_serial->isConnected()) {
+              uint8_t frame[1];
+              frame[0] = PUSH_CODE_MSG_WAITING;
+              _serial->writeFrame(frame, 1);
+            }
+          }
         }
       }
     }
