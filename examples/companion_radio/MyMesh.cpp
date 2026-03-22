@@ -615,7 +615,7 @@ void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packe
           }
 
           char reply_text[MAX_TEXT_LEN];
-          snprintf(reply_text, sizeof(reply_text), "@%s %s", sender_name, path_str);
+          snprintf(reply_text, sizeof(reply_text), "@[%s] %s", sender_name, path_str);
 
           uint32_t now = getRTCClock()->getCurrentTime();
           sendGroupMessage(now, ch_details.channel, getNodeName(), reply_text, strlen(reply_text));
