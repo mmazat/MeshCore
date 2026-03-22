@@ -117,3 +117,7 @@ There are a number of fairly major features in the pipeline, with no particular 
 - Report bugs and request features on the [GitHub Issues](https://github.com/ripplebiz/MeshCore/issues) page.
 - Find additional guides and components on [my site](https://buymeacoffee.com/ripplebiz).
 - Join [MeshCore Discord](https://discord.gg/BMwCtwHj5V) to chat with the developers and get help from the community.
+
+
+# To compile and upload
+pio run  -e Heltec_v2_companion_radio_ble --target upload
