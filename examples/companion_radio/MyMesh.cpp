@@ -568,39 +568,35 @@ void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packe
     ChannelDetails ch_details;
     if (getChannel(channel_idx, ch_details)) {
       if (strcmp(ch_details.name, "#test") == 0 || strcmp(ch_details.name, "test") == 0) {
-        // Check if message text contains the word "test" (case-insensitive, must be a whole word)
-        bool has_test = false;
-        for (const char *p = text; *p; p++) {
-          if ((p[0] == 't' || p[0] == 'T') &&
-              (p[1] == 'e' || p[1] == 'E') &&
-              (p[2] == 's' || p[2] == 'S') &&
-              (p[3] == 't' || p[3] == 'T') &&
-              (p[4] == '\0' || p[4] == ' ' || p[4] == '.' || p[4] == ',' || p[4] == '!' || p[4] == '?')) {
-            // Also check that it's not part of a longer word (check char before)
-            if (p == text || p[-1] == ' ' || p[-1] == ':' || p[-1] == '.' || p[-1] == ',') {
-              has_test = true;
-              break;
-            }
-          }
+        // Extract sender name and message body from "sender_name: message" format
+        char sender_name[32];
+        const char *msg_body = text;
+        const char *sep = strstr(text, ": ");
+        if (sep && (sep - text) < (int)sizeof(sender_name)) {
+          int name_len = sep - text;
+          memcpy(sender_name, text, name_len);
+          sender_name[name_len] = '\0';
+          msg_body = sep + 2;  // skip past ": "
+        } else {
+          strncpy(sender_name, "Unknown", sizeof(sender_name));
         }
-        if (has_test) {
-          // Extract sender name from "sender_name: message" format
-          char sender_name[32];
-          const char *sep = strstr(text, ": ");
-          if (sep && (sep - text) < (int)sizeof(sender_name)) {
-            int name_len = sep - text;
-            memcpy(sender_name, text, name_len);
-            sender_name[name_len] = '\0';
-          } else {
-            strncpy(sender_name, "Unknown", sizeof(sender_name));
-          }
 
-          // Don't reply to our own messages
-          if (strcmp(sender_name, getNodeName()) != 0) {
-            char reply_text[MAX_TEXT_LEN];
-            snprintf(reply_text, sizeof(reply_text), "Hey %s, I got your test message!", sender_name);
-            sendGroupMessage(getRTCClock()->getCurrentTime(), ch_details.channel, getNodeName(), reply_text, strlen(reply_text));
-          }
+        // Check if the message body is exactly "test" (case-insensitive, allow trailing spaces)
+        bool is_test = (msg_body[0] == 't' || msg_body[0] == 'T') &&
+                       (msg_body[1] == 'e' || msg_body[1] == 'E') &&
+                       (msg_body[2] == 's' || msg_body[2] == 'S') &&
+                       (msg_body[3] == 't' || msg_body[3] == 'T');
+        if (is_test) {
+          // Only allow trailing spaces or end of string
+          const char *tail = &msg_body[4];
+          while (*tail == ' ') tail++;
+          if (*tail != '\0') is_test = false;
+        }
+
+        if (is_test && strcmp(sender_name, getNodeName()) != 0) {
+          char reply_text[MAX_TEXT_LEN];
+          snprintf(reply_text, sizeof(reply_text), "Hey %s, I got your test message!", sender_name);
+          sendGroupMessage(getRTCClock()->getCurrentTime(), ch_details.channel, getNodeName(), reply_text, strlen(reply_text));
         }
       }
     }
