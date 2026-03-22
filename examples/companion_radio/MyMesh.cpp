@@ -595,9 +595,12 @@ void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packe
             strncpy(sender_name, "Unknown", sizeof(sender_name));
           }
 
-          char reply_text[MAX_TEXT_LEN];
-          snprintf(reply_text, sizeof(reply_text), "Hey %s, I got your test message!", sender_name);
-          sendGroupMessage(getRTCClock()->getCurrentTime(), ch_details.channel, getNodeName(), reply_text, strlen(reply_text));
+          // Don't reply to our own messages
+          if (strcmp(sender_name, getNodeName()) != 0) {
+            char reply_text[MAX_TEXT_LEN];
+            snprintf(reply_text, sizeof(reply_text), "Hey %s, I got your test message!", sender_name);
+            sendGroupMessage(getRTCClock()->getCurrentTime(), ch_details.channel, getNodeName(), reply_text, strlen(reply_text));
+          }
         }
       }
     }
