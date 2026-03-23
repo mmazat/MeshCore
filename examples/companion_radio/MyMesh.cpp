@@ -634,7 +634,7 @@ void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packe
               out_frame[ri++] = RESP_CODE_CHANNEL_MSG_RECV;
             }
             out_frame[ri++] = channel_idx;
-            out_frame[ri++] = 0xFF; // path_len = direct
+            out_frame[ri++] = 0; // path_len = 0 hops (locally generated)
             out_frame[ri++] = TXT_TYPE_PLAIN;
             memcpy(&out_frame[ri], &now, 4);
             ri += 4;
