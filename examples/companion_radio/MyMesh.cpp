@@ -4,6 +4,10 @@
 #include <ctype.h>
 #include <Mesh.h>
 
+#if defined(HELTEC_LORA_V4) && !defined(PIN_BUZZER)
+#define PIN_BUZZER 47
+#endif
+
 static const char *skipWhitespace(const char *text) {
   while (*text != 0 && isspace((unsigned char)*text)) {
     text++;
@@ -31,6 +35,27 @@ static void blinkBuzzLed() {
   delay(120);
   digitalWrite(P_LORA_TX_LED, LOW);
 #endif
+}
+
+static void buzzBuzzer() {
+#ifdef PIN_BUZZER
+  static bool buzzer_initialized = false;
+
+  if (!buzzer_initialized) {
+    pinMode(PIN_BUZZER, OUTPUT);
+    digitalWrite(PIN_BUZZER, LOW);
+    buzzer_initialized = true;
+  }
+
+  tone(PIN_BUZZER, 2400, 180);
+  delay(200);
+  noTone(PIN_BUZZER);
+#endif
+}
+
+static void blinkAndBuzz() {
+  blinkBuzzLed();
+  buzzBuzzer();
 }
 
 #define CMD_APP_START                 1
@@ -617,7 +642,7 @@ void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packe
     Serial.printf("buzz rx: channel_idx=%d name=%s raw='%s' cmd='%s'\n",
                   channel_idx_int, channel_name, text, command_text);
 
-    blinkBuzzLed();
+    blinkAndBuzz();
 
     bool sent_reply = sendGroupMessage(received_at, reply_channel, getNodeName(), reply_text, strlen(reply_text));
     Serial.printf("buzz tx: sent=%d reply=%s\n", sent_reply ? 1 : 0, reply_text);
