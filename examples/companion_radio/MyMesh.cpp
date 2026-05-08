@@ -1,7 +1,37 @@
 #include "MyMesh.h"
 
 #include <Arduino.h> // needed for PlatformIO
+#include <ctype.h>
 #include <Mesh.h>
+
+static const char *skipWhitespace(const char *text) {
+  while (*text != 0 && isspace((unsigned char)*text)) {
+    text++;
+  }
+  return text;
+}
+
+static bool isBuzzCommand(const char *text) {
+  const char *command = skipWhitespace(text);
+  if (strncmp(command, "!buzz", 5) != 0) {
+    return false;
+  }
+
+  command = skipWhitespace(command + 5);
+  return *command == 0;
+}
+
+static void blinkBuzzLed() {
+#ifdef PIN_STATUS_LED
+  digitalWrite(PIN_STATUS_LED, LED_STATE_ON);
+  delay(120);
+  digitalWrite(PIN_STATUS_LED, !LED_STATE_ON);
+#elif defined(P_LORA_TX_LED)
+  digitalWrite(P_LORA_TX_LED, HIGH);
+  delay(120);
+  digitalWrite(P_LORA_TX_LED, LOW);
+#endif
+}
 
 #define CMD_APP_START                 1
 #define CMD_SEND_TXT_MSG              2
@@ -532,6 +562,10 @@ void MyMesh::onSignedMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uin
 
 void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packet *pkt, uint32_t timestamp,
                                   const char *text) {
+  const char *channel_name = "Unknown";
+  ChannelDetails channel_details;
+  bool is_meshcore_gw_channel = false;
+  int channel_idx_int = findChannelIdx(channel);
   int i = 0;
   if (app_target_ver >= 3) {
     out_frame[i++] = RESP_CODE_CHANNEL_MSG_RECV_V3;
@@ -542,9 +576,85 @@ void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packe
     out_frame[i++] = RESP_CODE_CHANNEL_MSG_RECV;
   }
 
-  uint8_t channel_idx = findChannelIdx(channel);
+  uint8_t channel_idx = channel_idx_int >= 0 ? (uint8_t)channel_idx_int : 0xFF;
   out_frame[i++] = channel_idx;
   uint8_t path_len = out_frame[i++] = pkt->isRouteFlood() ? pkt->path_len : 0xFF;
+
+  if (getChannel(channel_idx, channel_details)) {
+    channel_name = channel_details.name;
+    is_meshcore_gw_channel = strcmp(channel_name, "meshcore_gw") == 0;
+  }
+
+  if (!is_meshcore_gw_channel) {
+    for (int idx = 0; idx < MAX_GROUP_CHANNELS; idx++) {
+      if (getChannel(idx, channel_details)
+          && strcmp(channel_details.name, "meshcore_gw") == 0
+          && memcmp(channel_details.channel.hash, channel.hash, sizeof(channel.hash)) == 0) {
+        channel_idx_int = idx;
+        channel_idx = (uint8_t)idx;
+        out_frame[app_target_ver >= 3 ? 4 : 1] = channel_idx;
+        channel_name = channel_details.name;
+        is_meshcore_gw_channel = true;
+        break;
+      }
+    }
+  }
+
+  const char *command_text = text;
+  const char *sender_sep = strstr(text, ": ");
+  if (sender_sep != NULL) {
+    command_text = sender_sep + 2;
+  }
+  bool is_buzz_command = isBuzzCommand(command_text);
+  if (is_buzz_command) {
+    uint32_t received_at = getRTCClock()->getCurrentTime();
+    DateTime received_dt(received_at);
+    mesh::GroupChannel reply_channel = channel;
+    char reply_text[9];
+    snprintf(reply_text, sizeof(reply_text), "%02u:%02u:%02u",
+             received_dt.hour(), received_dt.minute(), received_dt.second());
+
+    Serial.printf("buzz rx: channel_idx=%d name=%s raw='%s' cmd='%s'\n",
+                  channel_idx_int, channel_name, text, command_text);
+
+    blinkBuzzLed();
+
+    bool sent_reply = sendGroupMessage(received_at, reply_channel, getNodeName(), reply_text, strlen(reply_text));
+    Serial.printf("buzz tx: sent=%d reply=%s\n", sent_reply ? 1 : 0, reply_text);
+
+    if (sent_reply) {
+      char full_reply[MAX_TEXT_LEN + 32];
+      snprintf(full_reply, sizeof(full_reply), "%s: %s", getNodeName(), reply_text);
+
+      int ri = 0;
+      if (app_target_ver >= 3) {
+        out_frame[ri++] = RESP_CODE_CHANNEL_MSG_RECV_V3;
+        out_frame[ri++] = 0;
+        out_frame[ri++] = 0;
+        out_frame[ri++] = 0;
+      } else {
+        out_frame[ri++] = RESP_CODE_CHANNEL_MSG_RECV;
+      }
+      out_frame[ri++] = channel_idx;
+      out_frame[ri++] = 0;
+      out_frame[ri++] = TXT_TYPE_PLAIN;
+      memcpy(&out_frame[ri], &received_at, 4);
+      ri += 4;
+      int reply_len = strlen(full_reply);
+      if (ri + reply_len > MAX_FRAME_SIZE) {
+        reply_len = MAX_FRAME_SIZE - ri;
+      }
+      memcpy(&out_frame[ri], full_reply, reply_len);
+      ri += reply_len;
+      addToOfflineQueue(out_frame, ri);
+
+      if (_serial->isConnected()) {
+        uint8_t frame[1];
+        frame[0] = PUSH_CODE_MSG_WAITING;
+        _serial->writeFrame(frame, 1);
+      }
+    }
+  }
 
   out_frame[i++] = TXT_TYPE_PLAIN;
   memcpy(&out_frame[i], &timestamp, 4);
@@ -567,12 +677,6 @@ void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packe
 #endif
   }
 #ifdef DISPLAY_CLASS
-  // Get the channel name from the channel index
-  const char *channel_name = "Unknown";
-  ChannelDetails channel_details;
-  if (getChannel(channel_idx, channel_details)) {
-    channel_name = channel_details.name;
-  }
   if (_ui) _ui->newMsg(path_len, channel_name, text, offline_queue_len);
 #endif
 }
