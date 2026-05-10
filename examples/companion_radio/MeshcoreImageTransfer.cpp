@@ -430,7 +430,7 @@ void MeshcoreImageTransfer::loop(MyMesh& mesh) {
     state_.last_attempt_millis = now;
     RetryPolicy::noteAttempt(state_.retry_state);
     saveState();
-    delay(100); // Add 100ms delay between packets
+    delay(1000); // Pace the camera sender to 1 second between packets
   }
 }
 
