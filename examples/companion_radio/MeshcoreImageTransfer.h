@@ -14,11 +14,25 @@ public:
   bool start(const char* file_path, uint32_t job_seed, const char* direct_target_name = nullptr);
   bool abort(MyMesh& mesh);
   void loop(MyMesh& mesh);
+  bool handleDirectMessage(MyMesh& mesh, const char* text, const char* sender_name,
+                           uint32_t response_timestamp, char* reply_text, size_t reply_text_len);
   bool handleProtocolMessage(const char* text, const char* sender_name = nullptr);
   bool formatBleProgressMessage(const char* text, char* out, size_t out_len) const;
   bool isActive() const { return state_.active != 0; }
 
 private:
+  struct RetryState {
+    uint8_t quick_retry_attempts;
+    uint8_t slow_retry_attempts;
+  };
+
+  class RetryPolicy {
+  public:
+    static void reset(RetryState& state);
+    static unsigned long currentDelayMillis(const RetryState& state);
+    static void noteAttempt(RetryState& state);
+  };
+
   struct PersistedState {
     uint32_t magic;
     uint16_t version;
@@ -30,6 +44,8 @@ private:
     uint32_t last_acked_chunk;
     uint32_t chunk_size;
     uint32_t last_attempt_millis;
+    uint32_t last_attempt_timeout_millis;
+    RetryState retry_state;
     char job_id[17];
     char file_path[96];
     char file_name[32];
@@ -40,6 +56,8 @@ private:
   bool saveState();
   void clearState();
   void appendLog(const char* fmt, ...);
+  void maybeReportRetryAttempt(MyMesh& mesh) const;
+  void reportLocalStatus(MyMesh& mesh, const char* text) const;
   bool sendStart(MyMesh& mesh);
   bool sendChunk(MyMesh& mesh);
   bool readChunk(uint32_t chunk_idx, uint8_t* buffer, size_t* bytes_read) const;

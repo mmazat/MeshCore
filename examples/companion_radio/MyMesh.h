@@ -103,6 +103,8 @@ public:
   bool sendTextToChannelNamed(const char* channel_name, const char* text, uint32_t timestamp, uint8_t* out_idx = nullptr);
   bool sendChannelDataToChannelNamed(const char* channel_name, uint16_t data_type, const uint8_t* data,
                                      size_t data_len, uint8_t* out_idx = nullptr);
+  void queueLocalPlainMessage(const char* text, uint32_t sender_timestamp = 0);
+  void queueContactPlainMessage(const ContactInfo& from, const char* text, uint32_t sender_timestamp = 0);
 
   int  getRecentlyHeard(AdvertPath dest[], int max_num);
 

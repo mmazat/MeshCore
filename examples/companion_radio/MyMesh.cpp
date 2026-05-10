@@ -1,44 +1,7 @@
 #include "MyMesh.h"
 
 #include <Arduino.h> // needed for PlatformIO
-#include <ctype.h>
 #include <Mesh.h>
-
-static const char *skipWhitespace(const char *text) {
-  while (*text != 0 && isspace((unsigned char)*text)) {
-    text++;
-  }
-  return text;
-}
-
-static bool isCaptureCommand(const char *text) {
-  const char *command = skipWhitespace(text);
-  if (strncmp(command, "!capture", 8) != 0) {
-    return false;
-  }
-
-  command = skipWhitespace(command + 8);
-  return *command == 0;
-}
-
-static const char *parseSendFileCommand(const char *text) {
-  const char *command = skipWhitespace(text);
-  if (strncmp(command, "!sendfile", 9) != 0) {
-    return nullptr;
-  }
-
-  command = skipWhitespace(command + 9);
-  return *command == 0 ? nullptr : command;
-}
-
-static bool isAbortCommand(const char *text) {
-  const char *command = skipWhitespace(text);
-  if (strncmp(command, "!abort", 6) != 0) {
-    return false;
-  }
-  command = skipWhitespace(command + 6);
-  return *command == 0;
-}
 
 
 #define CMD_APP_START                 1
@@ -145,6 +108,7 @@ static bool isAbortCommand(const char *text) {
 #define FLOOD_SEND_TIMEOUT_FACTOR       16.0f
 #define DIRECT_SEND_PERHOP_FACTOR       6.0f
 #define DIRECT_SEND_PERHOP_EXTRA_MILLIS 250
+#define MIN_DIRECT_SEND_TIMEOUT_MILLIS 30000
 #define LAZY_CONTACTS_WRITE_DELAY       5000
 
 #define PUBLIC_GROUP_PSK                "izOH6cXN6mrJ5e26oRXNcg=="
@@ -514,6 +478,93 @@ void MyMesh::queueMessage(const ContactInfo &from, uint8_t txt_type, mesh::Packe
 #endif
 }
 
+void MyMesh::queueContactPlainMessage(const ContactInfo& from, const char* text, uint32_t sender_timestamp) {
+  if (text == nullptr) {
+    return;
+  }
+
+  if (sender_timestamp == 0) {
+    sender_timestamp = getRTCClock()->getCurrentTime();
+  }
+
+  int i = 0;
+  if (app_target_ver >= 3) {
+    out_frame[i++] = RESP_CODE_CONTACT_MSG_RECV_V3;
+    out_frame[i++] = 0; // SNR = 0 (local message)
+    out_frame[i++] = 0; // reserved1
+    out_frame[i++] = 0; // reserved2
+  } else {
+    out_frame[i++] = RESP_CODE_CONTACT_MSG_RECV;
+  }
+  memcpy(&out_frame[i], from.id.pub_key, 6);
+  i += 6;
+  out_frame[i++] = 0xFF; // path_len: direct
+  out_frame[i++] = TXT_TYPE_PLAIN;
+  memcpy(&out_frame[i], &sender_timestamp, 4);
+  i += 4;
+  int tlen = strlen(text);
+  if (i + tlen > MAX_FRAME_SIZE) {
+    tlen = MAX_FRAME_SIZE - i;
+  }
+  memcpy(&out_frame[i], text, tlen);
+  i += tlen;
+  addToOfflineQueue(out_frame, i);
+
+  if (_serial->isConnected()) {
+    uint8_t frame[1];
+    frame[0] = PUSH_CODE_MSG_WAITING;
+    _serial->writeFrame(frame, 1);
+  }
+}
+
+void MyMesh::queueLocalPlainMessage(const char* text, uint32_t sender_timestamp) {
+  if (text == nullptr) {
+    return;
+  }
+
+  if (sender_timestamp == 0) {
+    sender_timestamp = getRTCClock()->getCurrentTime();
+  }
+
+  int i = 0;
+  if (app_target_ver >= 3) {
+    out_frame[i++] = RESP_CODE_CONTACT_MSG_RECV_V3;
+    out_frame[i++] = 0;
+    out_frame[i++] = 0;
+    out_frame[i++] = 0;
+  } else {
+    out_frame[i++] = RESP_CODE_CONTACT_MSG_RECV;
+  }
+  memcpy(&out_frame[i], self_id.pub_key, 6);
+  i += 6;
+  out_frame[i++] = 0xFF;
+  out_frame[i++] = TXT_TYPE_PLAIN;
+  memcpy(&out_frame[i], &sender_timestamp, 4);
+  i += 4;
+  int tlen = strlen(text);
+  if (i + tlen > MAX_FRAME_SIZE) {
+    tlen = MAX_FRAME_SIZE - i;
+  }
+  memcpy(&out_frame[i], text, tlen);
+  i += tlen;
+  addToOfflineQueue(out_frame, i);
+
+  if (_serial->isConnected()) {
+    uint8_t frame[1];
+    frame[0] = PUSH_CODE_MSG_WAITING;
+    _serial->writeFrame(frame, 1);
+  }
+
+#ifdef DISPLAY_CLASS
+  if (_ui) {
+    _ui->newMsg(0xFF, getNodeName(), text, offline_queue_len);
+    if (!_serial->isConnected()) {
+      _ui->notify(UIEventType::contactMessage);
+    }
+  }
+#endif
+}
+
 bool MyMesh::filterRecvFloodPacket(mesh::Packet* packet) {
   // REVISIT: try to determine which Region (from transport_codes[1]) that Sender is indicating for replies/responses
   //    if unknown, fallback to finding Region from transport_codes[0], the 'scope' used by Sender
@@ -569,54 +620,11 @@ void MyMesh::onMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t 
   }
 
   // Handle !capture / !sendfile / !abort commands arriving as direct messages.
-  // Reply goes back to the sender as a direct message.
   uint32_t response_timestamp = getRTCClock()->getCurrentTime();
 
-  if (isCaptureCommand(text)) {
-    char capture_path[48] = {0};
-    size_t bytes_written = 0;
-    uint16_t img_width = 0, img_height = 0;
-    bool capture_ok = board_capture_image_to_sd(capture_path, sizeof(capture_path), &bytes_written,
-                                                &img_width, &img_height);
-    bool transfer_started = false;
-    if (capture_ok) {
-      transfer_started = file_transfer.start(capture_path, response_timestamp, from.name);
-    }
-    char reply_text[160];
-    if (!capture_ok) {
-      snprintf(reply_text, sizeof(reply_text), "image capture failed");
-    } else if (!transfer_started) {
-      snprintf(reply_text, sizeof(reply_text), "captured %s %ux%u %luB, transfer failed",
-               capture_path, img_width, img_height, static_cast<unsigned long>(bytes_written));
-    } else {
-      snprintf(reply_text, sizeof(reply_text), "captured %s %ux%u %luB, transfer started to %s",
-               capture_path, img_width, img_height, static_cast<unsigned long>(bytes_written),
-               from.name);
-    }
-    queueMessage(from, TXT_TYPE_PLAIN, pkt, sender_timestamp, NULL, 0, text);
-    queueMessage(from, TXT_TYPE_PLAIN, pkt, sender_timestamp, NULL, 0, reply_text);
-    return;
-  }
-
-  const char *sendfile_path = parseSendFileCommand(text);
-  if (sendfile_path != nullptr) {
-    bool transfer_started = file_transfer.start(sendfile_path, response_timestamp, from.name);
-    char reply_text[160];
-    snprintf(reply_text, sizeof(reply_text),
-             "sendfile path=%s transfer=%s",
-             sendfile_path,
-             transfer_started ? "queued" : "busy-or-missing");
-    queueMessage(from, TXT_TYPE_PLAIN, pkt, sender_timestamp, NULL, 0, text);
-    queueMessage(from, TXT_TYPE_PLAIN, pkt, sender_timestamp, NULL, 0, reply_text);
-    return;
-  }
-
-  if (isAbortCommand(text)) {
-    bool was_active = file_transfer.abort(*this);
-    char reply_text[64];
-    snprintf(reply_text, sizeof(reply_text),
-             "abort transfer=%s",
-             was_active ? "aborted" : "none");
+  char reply_text[160];
+  if (file_transfer.handleDirectMessage(*this, text, from.name, response_timestamp,
+                                        reply_text, sizeof(reply_text))) {
     queueMessage(from, TXT_TYPE_PLAIN, pkt, sender_timestamp, NULL, 0, text);
     queueMessage(from, TXT_TYPE_PLAIN, pkt, sender_timestamp, NULL, 0, reply_text);
     return;
@@ -1018,9 +1026,10 @@ uint32_t MyMesh::calcFloodTimeoutMillisFor(uint32_t pkt_airtime_millis) const {
 }
 uint32_t MyMesh::calcDirectTimeoutMillisFor(uint32_t pkt_airtime_millis, uint8_t path_len) const {
   uint8_t path_hash_count = path_len & 63;
-  return SEND_TIMEOUT_BASE_MILLIS +
-         ((pkt_airtime_millis * DIRECT_SEND_PERHOP_FACTOR + DIRECT_SEND_PERHOP_EXTRA_MILLIS) *
-          (path_hash_count + 1));
+  uint32_t timeout = SEND_TIMEOUT_BASE_MILLIS +
+                     ((pkt_airtime_millis * DIRECT_SEND_PERHOP_FACTOR + DIRECT_SEND_PERHOP_EXTRA_MILLIS) *
+                      (path_hash_count + 1));
+  return timeout < MIN_DIRECT_SEND_TIMEOUT_MILLIS ? MIN_DIRECT_SEND_TIMEOUT_MILLIS : timeout;
 }
 
 void MyMesh::onSendTimeout() {}

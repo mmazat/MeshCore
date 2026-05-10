@@ -17,10 +17,14 @@ constexpr bool kLocalImageCaptureSupported = false;
 #endif
 
 constexpr uint32_t kStateMagic = 0x31524654; // TFR1
-constexpr uint16_t kStateVersion = 5;
+constexpr uint16_t kStateVersion = 7;
 constexpr uint32_t kNoChunkAcked = 0xFFFFFFFFu;
 constexpr size_t kRawChunkBytes = 96;
-constexpr unsigned long kRetryIntervalMs = 5000;
+constexpr unsigned long kMinAckWaitMillis = 30000;
+constexpr unsigned long kQuickRetryIntervalMs = 5000;
+constexpr unsigned long kSlowRetryIntervalMs = 60000;
+constexpr uint8_t kQuickRetryAttempts = 3;
+constexpr uint8_t kSlowRetryAttempts = 3;
 constexpr char kTransferDir[] = "/imgtx";
 constexpr char kStatePath[] = "/imgtx/state.bin";
 constexpr char kStateTmpPath[] = "/imgtx/state.bin.tmp";
@@ -100,6 +104,43 @@ const char* baseName(const char* path) {
 
 bool startsWith(const char* text, const char* prefix) {
   return strncmp(text, prefix, strlen(prefix)) == 0;
+}
+
+const char* skipWhitespace(const char* text) {
+  while (*text != 0 && isspace((unsigned char)*text)) {
+    text++;
+  }
+  return text;
+}
+
+bool isCaptureCommand(const char* text) {
+  const char* command = skipWhitespace(text);
+  if (strncmp(command, "!capture", 8) != 0) {
+    return false;
+  }
+
+  command = skipWhitespace(command + 8);
+  return *command == 0;
+}
+
+const char* parseSendFileCommand(const char* text) {
+  const char* command = skipWhitespace(text);
+  if (strncmp(command, "!sendfile", 9) != 0) {
+    return nullptr;
+  }
+
+  command = skipWhitespace(command + 9);
+  return *command == 0 ? nullptr : command;
+}
+
+bool isAbortCommand(const char* text) {
+  const char* command = skipWhitespace(text);
+  if (strncmp(command, "!abort", 6) != 0) {
+    return false;
+  }
+
+  command = skipWhitespace(command + 6);
+  return *command == 0;
 }
 
 ContactInfo* findContactBySenderName(MyMesh& mesh, const char* sender_name) {
@@ -192,6 +233,87 @@ void copyName(char* dest, size_t dest_size, const char* src) {
 
 } // namespace
 
+void MeshcoreImageTransfer::RetryPolicy::reset(RetryState& state) {
+  state.quick_retry_attempts = 0;
+  state.slow_retry_attempts = 0;
+}
+
+unsigned long MeshcoreImageTransfer::RetryPolicy::currentDelayMillis(const RetryState& state) {
+  return state.quick_retry_attempts < kQuickRetryAttempts ? kQuickRetryIntervalMs : kSlowRetryIntervalMs;
+}
+
+void MeshcoreImageTransfer::RetryPolicy::noteAttempt(RetryState& state) {
+  if (state.quick_retry_attempts < kQuickRetryAttempts) {
+    state.quick_retry_attempts++;
+    return;
+  }
+
+  if (state.slow_retry_attempts < kSlowRetryAttempts) {
+    state.slow_retry_attempts++;
+  }
+}
+
+void MeshcoreImageTransfer::reportLocalStatus(MyMesh& mesh, const char* text) const {
+  const char* target_name = state_.direct_target_name[0] != 0 ? state_.direct_target_name : nullptr;
+  ContactInfo* contact = findTargetContact(mesh, target_name);
+  if (contact != nullptr) {
+    mesh.queueContactPlainMessage(*contact, text);
+  } else {
+    mesh.queueLocalPlainMessage(text);
+  }
+}
+
+void MeshcoreImageTransfer::maybeReportRetryAttempt(MyMesh& mesh) const {
+  if (state_.last_attempt_millis == 0) {
+    return;
+  }
+
+  char message[128];
+  const bool waiting_for_start_ack = state_.start_acked == 0;
+  const unsigned long pending_chunk = state_.last_acked_chunk == kNoChunkAcked ? 0ul : state_.last_acked_chunk + 1;
+  const unsigned long ack_wait_millis = state_.last_attempt_timeout_millis == 0
+                                            ? kMinAckWaitMillis
+                                            : state_.last_attempt_timeout_millis;
+  if (state_.retry_state.quick_retry_attempts < kQuickRetryAttempts) {
+    if (waiting_for_start_ack) {
+      snprintf(message, sizeof(message),
+               "image transfer ack timeout on start after %lus, retry fast %u/%u after %lus",
+               ack_wait_millis / 1000ul,
+               static_cast<unsigned>(state_.retry_state.quick_retry_attempts),
+               static_cast<unsigned>(kQuickRetryAttempts),
+               static_cast<unsigned long>(kQuickRetryIntervalMs / 1000ul));
+    } else {
+      snprintf(message, sizeof(message),
+               "image transfer ack timeout on chunk %lu/%lu after %lus, retry fast %u/%u after %lus",
+               pending_chunk + 1,
+               static_cast<unsigned long>(state_.total_chunks),
+               ack_wait_millis / 1000ul,
+               static_cast<unsigned>(state_.retry_state.quick_retry_attempts),
+               static_cast<unsigned>(kQuickRetryAttempts),
+               static_cast<unsigned long>(kQuickRetryIntervalMs / 1000ul));
+    }
+  } else {
+    if (waiting_for_start_ack) {
+      snprintf(message, sizeof(message),
+               "image transfer ack timeout on start after %lus, retry slow %u/%u after %lus",
+               ack_wait_millis / 1000ul,
+               static_cast<unsigned>(state_.retry_state.slow_retry_attempts + 1),
+               static_cast<unsigned>(kSlowRetryAttempts),
+               static_cast<unsigned long>(kSlowRetryIntervalMs / 1000ul));
+    } else {
+      snprintf(message, sizeof(message),
+               "image transfer ack timeout on chunk %lu/%lu after %lus, retry slow %u/%u after %lus",
+               pending_chunk + 1,
+               static_cast<unsigned long>(state_.total_chunks),
+               ack_wait_millis / 1000ul,
+               static_cast<unsigned>(state_.retry_state.slow_retry_attempts + 1),
+               static_cast<unsigned>(kSlowRetryAttempts),
+               static_cast<unsigned long>(kSlowRetryIntervalMs / 1000ul));
+    }
+  }
+  reportLocalStatus(mesh, message);
+}
+
 void MeshcoreImageTransfer::begin() {
   state_fs_->mkdir(kTransferDir);
   if (loadState() && state_.active != 0) {
@@ -234,6 +356,8 @@ bool MeshcoreImageTransfer::start(const char* file_path, uint32_t job_seed, cons
   state_.total_chunks = static_cast<uint32_t>((file_size + kRawChunkBytes - 1) / kRawChunkBytes);
   state_.last_acked_chunk = kNoChunkAcked;
   state_.last_attempt_millis = 0;
+  state_.last_attempt_timeout_millis = 0;
+  RetryPolicy::reset(state_.retry_state);
   snprintf(state_.job_id, sizeof(state_.job_id), "%08lx%08lx",
            static_cast<unsigned long>(job_seed),
            static_cast<unsigned long>(file_size));
@@ -261,15 +385,109 @@ void MeshcoreImageTransfer::loop(MyMesh& mesh) {
   }
 
   unsigned long now = millis();
-  if (state_.last_attempt_millis != 0 && (now - state_.last_attempt_millis) < kRetryIntervalMs) {
-    return;
+  if (state_.last_attempt_millis != 0) {
+    unsigned long ack_wait_millis = state_.last_attempt_timeout_millis == 0
+                                        ? kMinAckWaitMillis
+                                        : state_.last_attempt_timeout_millis;
+    unsigned long elapsed = now - state_.last_attempt_millis;
+    if (elapsed < ack_wait_millis) {
+      return;
+    }
+
+    unsigned long retry_delay = RetryPolicy::currentDelayMillis(state_.retry_state);
+    if (elapsed < ack_wait_millis + retry_delay) {
+      return;
+    }
   }
 
-  bool sent = state_.start_acked == 0 ? sendStart(mesh) : sendChunk(mesh);
+  maybeReportRetryAttempt(mesh);
+  bool sent = false;
+  if (state_.start_acked == 0) {
+    sent = sendStart(mesh);
+    if (!sent) {
+      appendLog("sendStart failed: job=%s target=%s", state_.job_id, state_.direct_target_name);
+    }
+  } else {
+    sent = sendChunk(mesh);
+    if (!sent) {
+      appendLog("sendChunk failed: job=%s chunk=%lu/%lu target=%s", state_.job_id,
+                state_.last_acked_chunk == kNoChunkAcked ? 0ul : state_.last_acked_chunk + 1,
+                state_.total_chunks,
+                state_.direct_target_name);
+    }
+  }
   if (sent) {
     state_.last_attempt_millis = now;
+    RetryPolicy::noteAttempt(state_.retry_state);
     saveState();
+    delay(100); // Add 100ms delay between packets
   }
+}
+
+bool MeshcoreImageTransfer::handleDirectMessage(MyMesh& mesh, const char* text, const char* sender_name,
+                                                uint32_t response_timestamp, char* reply_text,
+                                                size_t reply_text_len) {
+  if (reply_text == nullptr || reply_text_len == 0) {
+    return false;
+  }
+
+  reply_text[0] = 0;
+
+  if (isCaptureCommand(text)) {
+    bool aborted_previous = false;
+    if (isActive()) {
+      aborted_previous = abort(mesh);
+    }
+
+    char capture_path[48] = {0};
+    size_t bytes_written = 0;
+    uint16_t img_width = 0;
+    uint16_t img_height = 0;
+    bool capture_ok = board_capture_image_to_sd(capture_path, sizeof(capture_path), &bytes_written,
+                                                &img_width, &img_height);
+    bool transfer_started = false;
+    if (capture_ok) {
+      transfer_started = start(capture_path, response_timestamp, sender_name);
+    }
+
+    if (!capture_ok) {
+      snprintf(reply_text, reply_text_len,
+               aborted_previous ? "aborted previous transfer, image capture failed"
+                                : "image capture failed");
+    } else if (!transfer_started) {
+      snprintf(reply_text, reply_text_len,
+               aborted_previous ? "aborted previous transfer, captured %s %ux%u %luB, transfer failed"
+                                : "captured %s %ux%u %luB, transfer failed",
+               capture_path, img_width, img_height, static_cast<unsigned long>(bytes_written));
+    } else {
+      snprintf(reply_text, reply_text_len,
+               aborted_previous ? "aborted previous transfer, captured %s %ux%u %luB, transfer started to %s"
+                                : "captured %s %ux%u %luB, transfer started to %s",
+               capture_path, img_width, img_height, static_cast<unsigned long>(bytes_written),
+               sender_name == nullptr ? "" : sender_name);
+    }
+    return true;
+  }
+
+  const char* sendfile_path = parseSendFileCommand(text);
+  if (sendfile_path != nullptr) {
+    bool transfer_started = start(sendfile_path, response_timestamp, sender_name);
+    snprintf(reply_text, reply_text_len,
+             "sendfile path=%s transfer=%s",
+             sendfile_path,
+             transfer_started ? "queued" : "busy-or-missing");
+    return true;
+  }
+
+  if (isAbortCommand(text)) {
+    bool was_active = abort(mesh);
+    snprintf(reply_text, reply_text_len,
+             "abort transfer=%s",
+             was_active ? "aborted" : "none");
+    return true;
+  }
+
+  return false;
 }
 
 bool MeshcoreImageTransfer::handleProtocolMessage(const char* text, const char* sender_name) {
@@ -296,6 +514,8 @@ bool MeshcoreImageTransfer::handleProtocolMessage(const char* text, const char* 
     }
     state_.start_acked = 1;
     state_.last_attempt_millis = 0;
+    state_.last_attempt_timeout_millis = 0;
+    RetryPolicy::reset(state_.retry_state);
     appendLog("ack-start job=%s target=%s", state_.job_id,
               state_.direct_target_name[0] != 0 ? state_.direct_target_name : "(none)");
     saveState();
@@ -316,6 +536,8 @@ bool MeshcoreImageTransfer::handleProtocolMessage(const char* text, const char* 
       }
       state_.last_acked_chunk = chunk_idx;
       state_.last_attempt_millis = 0;
+      state_.last_attempt_timeout_millis = 0;
+      RetryPolicy::reset(state_.retry_state);
       appendLog("ack-chunk job=%s idx=%lu/%lu", state_.job_id,
                 static_cast<unsigned long>(chunk_idx),
                 static_cast<unsigned long>(state_.total_chunks));
@@ -480,6 +702,7 @@ bool MeshcoreImageTransfer::sendStart(MyMesh& mesh) {
   if (recipient == nullptr) {
     appendLog("missing-contact job=%s want=%s", state_.job_id,
               target_name != nullptr ? target_name : "(none)");
+    reportLocalStatus(mesh, "image transfer send failed: missing target contact");
     return false;
   }
 
@@ -493,9 +716,15 @@ bool MeshcoreImageTransfer::sendStart(MyMesh& mesh) {
       expected_ack,
       est_timeout) != MSG_SEND_FAILED;
   if (sent) {
+    state_.last_attempt_timeout_millis = est_timeout < kMinAckWaitMillis ? kMinAckWaitMillis : est_timeout;
+  }
+  if (sent) {
     appendLog("send-start-direct job=%s via=%s", state_.job_id, recipient->name);
   } else {
     appendLog("send-start-direct-failed job=%s via=%s", state_.job_id, recipient->name);
+    char status[96];
+    snprintf(status, sizeof(status), "image transfer send failed on start via %s", recipient->name);
+    mesh.queueContactPlainMessage(*recipient, status);
   }
   return sent;
 }
@@ -545,6 +774,7 @@ bool MeshcoreImageTransfer::sendChunk(MyMesh& mesh) {
   if (recipient == nullptr) {
     appendLog("missing-contact job=%s want=%s", state_.job_id,
               target_name != nullptr ? target_name : "(none)");
+    reportLocalStatus(mesh, "image transfer send failed: missing target contact");
     return false;
   }
 
@@ -558,6 +788,9 @@ bool MeshcoreImageTransfer::sendChunk(MyMesh& mesh) {
       expected_ack,
       est_timeout) != MSG_SEND_FAILED;
   if (sent) {
+    state_.last_attempt_timeout_millis = est_timeout < kMinAckWaitMillis ? kMinAckWaitMillis : est_timeout;
+  }
+  if (sent) {
     appendLog("send-chunk job=%s idx=%lu bytes=%u via=%s", state_.job_id,
               static_cast<unsigned long>(next_chunk),
               static_cast<unsigned>(bytes_read),
@@ -566,6 +799,12 @@ bool MeshcoreImageTransfer::sendChunk(MyMesh& mesh) {
     appendLog("send-chunk-failed job=%s idx=%lu via=%s", state_.job_id,
               static_cast<unsigned long>(next_chunk),
               recipient->name);
+    char status[112];
+    snprintf(status, sizeof(status), "image transfer send failed on chunk %lu/%lu via %s",
+             static_cast<unsigned long>(next_chunk + 1),
+             static_cast<unsigned long>(state_.total_chunks),
+             recipient->name);
+    mesh.queueContactPlainMessage(*recipient, status);
   }
   return sent;
 }
@@ -623,4 +862,5 @@ void MeshcoreImageTransfer::resetState() {
   state_.version = kStateVersion;
   state_.last_acked_chunk = kNoChunkAcked;
   state_.chunk_size = static_cast<uint32_t>(kRawChunkBytes);
+  RetryPolicy::reset(state_.retry_state);
 }
