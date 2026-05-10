@@ -542,8 +542,11 @@ bool MeshcoreImageTransfer::handleProtocolMessage(const char* text, const char* 
                 static_cast<unsigned long>(chunk_idx),
                 static_cast<unsigned long>(state_.total_chunks));
       if (state_.last_acked_chunk + 1 >= state_.total_chunks) {
-        appendLog("complete job=%s path=%s", state_.job_id, state_.file_path);
+        appendLog("complete job=%s path=%s, clearing and resetting state", state_.job_id, state_.file_path);
         clearState();
+        // Extra: reload and log state to confirm reset
+        bool loaded = loadState();
+        appendLog("post-complete state.active=%u job_id=%s", state_.active, state_.job_id);
       } else {
         saveState();
       }
@@ -552,8 +555,11 @@ bool MeshcoreImageTransfer::handleProtocolMessage(const char* text, const char* 
   }
 
   if (strcmp(verb, "x") == 0) {
-    appendLog("abort job=%s reason=%s", state_.job_id, save_ptr == nullptr ? "unspecified" : save_ptr);
+    appendLog("abort job=%s reason=%s, clearing and resetting state", state_.job_id, save_ptr == nullptr ? "unspecified" : save_ptr);
     clearState();
+    // Extra: reload and log state to confirm reset
+    bool loaded = loadState();
+    appendLog("post-abort state.active=%u job_id=%s", state_.active, state_.job_id);
     return true;
   }
 
