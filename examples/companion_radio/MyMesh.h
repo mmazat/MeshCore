@@ -24,6 +24,7 @@
 #endif
 
 #include "DataStore.h"
+#include "MeshcoreImageTransfer.h"
 #include "NodePrefs.h"
 
 #include <RTClib.h>
@@ -99,6 +100,9 @@ public:
   void handleCmdFrame(size_t len);
   bool advert();
   void enterCLIRescue();
+  bool sendTextToChannelNamed(const char* channel_name, const char* text, uint32_t timestamp, uint8_t* out_idx = nullptr);
+  bool sendChannelDataToChannelNamed(const char* channel_name, uint16_t data_type, const uint8_t* data,
+                                     size_t data_len, uint8_t* out_idx = nullptr);
 
   int  getRecentlyHeard(AdvertPath dest[], int max_num);
 
@@ -136,6 +140,8 @@ protected:
                          const char *text) override;
   void onSignedMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t sender_timestamp,
                            const uint8_t *sender_prefix, const char *text) override;
+  void onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, const uint8_t *secret,
+                      uint8_t *data, size_t len) override;
   void onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packet *pkt, uint32_t timestamp,
                             const char *text) override;
   void onChannelDataRecv(const mesh::GroupChannel &channel, mesh::Packet *pkt, uint16_t data_type,
@@ -195,12 +201,14 @@ private:
   void checkCLIRescueCmd();
   void checkSerialInterface();
   bool isValidClientRepeatFreq(uint32_t f) const;
+  bool getChannelByName(const char* channel_name, ChannelDetails& dest, uint8_t* out_idx = nullptr) const;
 
   // helpers, short-cuts
   void saveChannels() { _store->saveChannels(this); }
   void saveContacts() { _store->saveContacts(this); }
 
   DataStore* _store;
+  MeshcoreImageTransfer file_transfer;
   NodePrefs _prefs;
   uint32_t pending_login;
   uint32_t pending_status;
@@ -250,3 +258,6 @@ private:
 };
 
 extern MyMesh the_mesh;
+
+bool sendMeshTextToChannelNamed(MyMesh& mesh, const char* channel_name, const char* text, uint32_t timestamp,
+                                uint8_t* out_idx = nullptr);

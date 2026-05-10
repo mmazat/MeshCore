@@ -90,6 +90,18 @@ protected:
 
   void bootstrapRTCfromContacts();
   void resetContacts() { num_contacts = 0; }
+  ContactInfo* getContactForSenderIdx(int sender_idx) {
+    if (sender_idx < 0 || sender_idx >= MAX_SEARCH_RESULTS) {
+      return nullptr;
+    }
+
+    int contact_idx = matching_peer_indexes[sender_idx];
+    if (contact_idx < 0 || contact_idx >= num_contacts) {
+      return nullptr;
+    }
+
+    return &contacts[contact_idx];
+  }
   void populateContactFromAdvert(ContactInfo& ci, const mesh::Identity& id, const AdvertDataParser& parser, uint32_t timestamp);
   ContactInfo* allocateContactSlot(); // helper to find slot for new contact
 

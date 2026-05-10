@@ -21,7 +21,25 @@ static bool isCaptureCommand(const char *text) {
   return *command == 0;
 }
 
-static const char *CAPTURE_REPLY_CHANNEL_NAME = "meshcore_gw";
+static const char *parseSendFileCommand(const char *text) {
+  const char *command = skipWhitespace(text);
+  if (strncmp(command, "!sendfile", 9) != 0) {
+    return nullptr;
+  }
+
+  command = skipWhitespace(command + 9);
+  return *command == 0 ? nullptr : command;
+}
+
+static bool isAbortCommand(const char *text) {
+  const char *command = skipWhitespace(text);
+  if (strncmp(command, "!abort", 6) != 0) {
+    return false;
+  }
+  command = skipWhitespace(command + 6);
+  return *command == 0;
+}
+
 
 #define CMD_APP_START                 1
 #define CMD_SEND_TXT_MSG              2
@@ -116,8 +134,12 @@ static const char *CAPTURE_REPLY_CHANNEL_NAME = "meshcore_gw";
 #define RESP_ALLOWED_REPEAT_FREQ      26
 #define RESP_CODE_CHANNEL_DATA_RECV   27
 #define RESP_CODE_DEFAULT_FLOOD_SCOPE 28
+#define RESP_CODE_CONTACT_DATA_RECV   29
 
 #define MAX_CHANNEL_DATA_LENGTH       (MAX_FRAME_SIZE - 9)
+#define MAX_CONTACT_DATA_LENGTH       (MAX_FRAME_SIZE - 12)
+
+#define REQ_TYPE_DIRECT_BINARY_DATA   0x49
 
 #define SEND_TIMEOUT_BASE_MILLIS        500
 #define FLOOD_SEND_TIMEOUT_FACTOR       16.0f
@@ -533,6 +555,74 @@ void MyMesh::sendFloodScoped(const mesh::GroupChannel& channel, mesh::Packet* pk
 void MyMesh::onMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t sender_timestamp,
                            const char *text) {
   markConnectionActive(from); // in case this is from a server, and we have a connection
+
+#if defined(ESP32_S3_N16R8_SX1262)
+  // Handle @img1| protocol acks arriving as direct messages (e.g. from meshcore_gw)
+  char ble_progress_text[96];
+  bool have_ble_progress = file_transfer.formatBleProgressMessage(text, ble_progress_text, sizeof(ble_progress_text));
+  if (file_transfer.handleProtocolMessage(text, from.name)) {
+    queueMessage(from, TXT_TYPE_PLAIN, pkt, sender_timestamp, NULL, 0, text);
+    if (have_ble_progress) {
+      queueMessage(from, TXT_TYPE_PLAIN, pkt, sender_timestamp, NULL, 0, ble_progress_text);
+    }
+    return;
+  }
+
+  // Handle !capture / !sendfile / !abort commands arriving as direct messages.
+  // Reply goes back to the sender as a direct message.
+  uint32_t response_timestamp = getRTCClock()->getCurrentTime();
+
+  if (isCaptureCommand(text)) {
+    char capture_path[48] = {0};
+    size_t bytes_written = 0;
+    uint16_t img_width = 0, img_height = 0;
+    bool capture_ok = board_capture_image_to_sd(capture_path, sizeof(capture_path), &bytes_written,
+                                                &img_width, &img_height);
+    bool transfer_started = false;
+    if (capture_ok) {
+      transfer_started = file_transfer.start(capture_path, response_timestamp, from.name);
+    }
+    char reply_text[160];
+    if (!capture_ok) {
+      snprintf(reply_text, sizeof(reply_text), "image capture failed");
+    } else if (!transfer_started) {
+      snprintf(reply_text, sizeof(reply_text), "captured %s %ux%u %luB, transfer failed",
+               capture_path, img_width, img_height, static_cast<unsigned long>(bytes_written));
+    } else {
+      snprintf(reply_text, sizeof(reply_text), "captured %s %ux%u %luB, transfer started to %s",
+               capture_path, img_width, img_height, static_cast<unsigned long>(bytes_written),
+               from.name);
+    }
+    queueMessage(from, TXT_TYPE_PLAIN, pkt, sender_timestamp, NULL, 0, text);
+    queueMessage(from, TXT_TYPE_PLAIN, pkt, sender_timestamp, NULL, 0, reply_text);
+    return;
+  }
+
+  const char *sendfile_path = parseSendFileCommand(text);
+  if (sendfile_path != nullptr) {
+    bool transfer_started = file_transfer.start(sendfile_path, response_timestamp, from.name);
+    char reply_text[160];
+    snprintf(reply_text, sizeof(reply_text),
+             "sendfile path=%s transfer=%s",
+             sendfile_path,
+             transfer_started ? "queued" : "busy-or-missing");
+    queueMessage(from, TXT_TYPE_PLAIN, pkt, sender_timestamp, NULL, 0, text);
+    queueMessage(from, TXT_TYPE_PLAIN, pkt, sender_timestamp, NULL, 0, reply_text);
+    return;
+  }
+
+  if (isAbortCommand(text)) {
+    bool was_active = file_transfer.abort(*this);
+    char reply_text[64];
+    snprintf(reply_text, sizeof(reply_text),
+             "abort transfer=%s",
+             was_active ? "aborted" : "none");
+    queueMessage(from, TXT_TYPE_PLAIN, pkt, sender_timestamp, NULL, 0, text);
+    queueMessage(from, TXT_TYPE_PLAIN, pkt, sender_timestamp, NULL, 0, reply_text);
+    return;
+  }
+#endif
+
   queueMessage(from, TXT_TYPE_PLAIN, pkt, sender_timestamp, NULL, 0, text);
 }
 
@@ -565,75 +655,30 @@ void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packe
   uint8_t channel_idx = findChannelIdx(channel);
   out_frame[i++] = channel_idx;
   uint8_t path_len = out_frame[i++] = pkt->isRouteFlood() ? pkt->path_len : 0xFF;
+  const char *channel_name = "Unknown";
+  ChannelDetails channel_details;
+  if (getChannel(channel_idx, channel_details)) {
+    channel_name = channel_details.name;
+  }
 
 #if defined(ESP32_S3_N16R8_SX1262)
   const char *command_text = text;
+  const char *sender_name = nullptr;
+  char sender_name_buf[32] = {0};
   const char *sender_sep = strstr(text, ": ");
   if (sender_sep != NULL) {
+    size_t sender_len = static_cast<size_t>(sender_sep - text);
+    if (sender_len >= sizeof(sender_name_buf)) {
+      sender_len = sizeof(sender_name_buf) - 1;
+    }
+    memcpy(sender_name_buf, text, sender_len);
+    sender_name_buf[sender_len] = 0;
+    sender_name = sender_name_buf;
     command_text = sender_sep + 2;
   }
 
-  if (isCaptureCommand(command_text)) {
-    uint32_t response_timestamp = getRTCClock()->getCurrentTime();
-    char capture_path[48] = {0};
-    size_t bytes_written = 0;
-    bool capture_ok = board_capture_image_to_sd(capture_path, sizeof(capture_path), &bytes_written);
-    char reply_text[160];
-    snprintf(reply_text, sizeof(reply_text),
-             "capture success=%s write=%s bytes=%u path=%s",
-             capture_ok ? "true" : "false",
-             capture_ok ? "ok" : "failed",
-             static_cast<unsigned>(bytes_written),
-             capture_ok ? capture_path : "-");
-    mesh::GroupChannel reply_channel = channel;
-    uint8_t reply_channel_idx = channel_idx;
-    ChannelDetails reply_channel_details;
-
-    for (uint8_t idx = 0; idx < MAX_GROUP_CHANNELS; idx++) {
-      if (getChannel(idx, reply_channel_details)
-          && strcmp(reply_channel_details.name, CAPTURE_REPLY_CHANNEL_NAME) == 0) {
-        reply_channel = reply_channel_details.channel;
-        reply_channel_idx = idx;
-        break;
-      }
-    }
-
-    bool sent_reply = sendGroupMessage(response_timestamp, reply_channel, getNodeName(), reply_text,
-                                       strlen(reply_text));
-
-    if (sent_reply) {
-      char full_reply[128];
-      snprintf(full_reply, sizeof(full_reply), "%s: %s", getNodeName(), reply_text);
-
-      int ri = 0;
-      if (app_target_ver >= 3) {
-        out_frame[ri++] = RESP_CODE_CHANNEL_MSG_RECV_V3;
-        out_frame[ri++] = 0;
-        out_frame[ri++] = 0;
-        out_frame[ri++] = 0;
-      } else {
-        out_frame[ri++] = RESP_CODE_CHANNEL_MSG_RECV;
-      }
-      out_frame[ri++] = reply_channel_idx;
-      out_frame[ri++] = 0;
-      out_frame[ri++] = TXT_TYPE_PLAIN;
-      memcpy(&out_frame[ri], &response_timestamp, 4);
-      ri += 4;
-
-      int reply_len = strlen(full_reply);
-      if (ri + reply_len > MAX_FRAME_SIZE) {
-        reply_len = MAX_FRAME_SIZE - ri;
-      }
-      memcpy(&out_frame[ri], full_reply, reply_len);
-      ri += reply_len;
-      addToOfflineQueue(out_frame, ri);
-
-      if (_serial->isConnected()) {
-        uint8_t frame[1];
-        frame[0] = PUSH_CODE_MSG_WAITING;
-        _serial->writeFrame(frame, 1);
-      }
-    }
+  if (file_transfer.handleProtocolMessage(command_text, sender_name)) {
+    return;
   }
 #endif
 
@@ -659,11 +704,6 @@ void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packe
   }
 #ifdef DISPLAY_CLASS
   // Get the channel name from the channel index
-  const char *channel_name = "Unknown";
-  ChannelDetails channel_details;
-  if (getChannel(channel_idx, channel_details)) {
-    channel_name = channel_details.name;
-  }
   if (_ui) _ui->newMsg(path_len, channel_name, text, offline_queue_len);
 #endif
 }
@@ -701,6 +741,57 @@ void MyMesh::onChannelDataRecv(const mesh::GroupChannel &channel, mesh::Packet *
     frame[0] = PUSH_CODE_MSG_WAITING; // send push 'tickle'
     _serial->writeFrame(frame, 1);
   }
+}
+
+void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, const uint8_t *secret,
+                            uint8_t *data, size_t len) {
+  if (type == PAYLOAD_TYPE_REQ && len > 4 && data[4] == REQ_TYPE_DIRECT_BINARY_DATA) {
+    ContactInfo *from = getContactForSenderIdx(sender_idx);
+    if (from == nullptr) {
+      MESH_DEBUG_PRINTLN("onPeerDataRecv: invalid sender idx for direct data: %d", sender_idx);
+      return;
+    }
+
+    from->lastmod = getRTCClock()->getCurrentTime();
+
+    const uint8_t *payload = &data[4];
+    size_t payload_len = len - 4;
+    if (payload_len > MAX_CONTACT_DATA_LENGTH) {
+      MESH_DEBUG_PRINTLN("onPeerDataRecv: dropping payload_len=%d exceeds frame limit=%d",
+                         (uint32_t)payload_len, (uint32_t)MAX_CONTACT_DATA_LENGTH);
+      return;
+    }
+
+    int i = 0;
+    out_frame[i++] = RESP_CODE_CONTACT_DATA_RECV;
+    out_frame[i++] = (int8_t)(packet->getSNR() * 4);
+    out_frame[i++] = 0; // reserved1
+    out_frame[i++] = 0; // reserved2
+    memcpy(&out_frame[i], from->id.pub_key, 6);
+    i += 6;
+    out_frame[i++] = packet->isRouteFlood() ? packet->path_len : 0xFF;
+    out_frame[i++] = (uint8_t)payload_len;
+
+    if (payload_len > 0) {
+      memcpy(&out_frame[i], payload, payload_len);
+      i += (int)payload_len;
+    }
+    addToOfflineQueue(out_frame, i);
+
+    if (_serial->isConnected()) {
+      uint8_t frame[1];
+      frame[0] = PUSH_CODE_MSG_WAITING;
+      _serial->writeFrame(frame, 1);
+    }
+
+    if (packet->isRouteFlood()) {
+      mesh::Packet *path = createPathReturn(from->id, secret, packet->path, packet->path_len, 0, NULL, 0);
+      if (path) sendFloodScoped(*from, path);
+    }
+    return;
+  }
+
+  BaseChatMesh::onPeerDataRecv(packet, type, sender_idx, secret, data, len);
 }
 
 uint8_t MyMesh::onContactRequest(const ContactInfo &contact, uint32_t sender_timestamp, const uint8_t *data,
@@ -936,7 +1027,7 @@ void MyMesh::onSendTimeout() {}
 
 MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMeshTables &tables, DataStore& store, AbstractUITask* ui)
     : BaseChatMesh(radio, *new ArduinoMillis(), rng, rtc, *new StaticPoolPacketManager(16), tables),
-      _serial(NULL), telemetry(MAX_PACKET_PAYLOAD - 4), _store(&store), _ui(ui) {
+  _serial(NULL), telemetry(MAX_PACKET_PAYLOAD - 4), _store(&store), file_transfer(*store.getPrimaryFS()), _ui(ui) {
   _iter_started = false;
   _cli_rescue = false;
   offline_queue_len = 0;
@@ -1041,12 +1132,65 @@ void MyMesh::begin(bool has_display) {
   bootstrapRTCfromContacts();
   addChannel("Public", PUBLIC_GROUP_PSK); // pre-configure Andy's public channel
   _store->loadChannels(this);
+  file_transfer.begin();
 
   radio_set_params(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
   radio_set_tx_power(_prefs.tx_power_dbm);
   radio_driver.setRxBoostedGainMode(_prefs.rx_boosted_gain);
   MESH_DEBUG_PRINTLN("RX Boosted Gain Mode: %s",
                      radio_driver.getRxBoostedGainMode() ? "Enabled" : "Disabled");
+}
+
+bool MyMesh::getChannelByName(const char* channel_name, ChannelDetails& dest, uint8_t* out_idx) const {
+  if (channel_name == nullptr) {
+    return false;
+  }
+
+  for (uint8_t idx = 0; idx < MAX_GROUP_CHANNELS; idx++) {
+    ChannelDetails channel;
+    if (const_cast<MyMesh*>(this)->getChannel(idx, channel) && strcmp(channel.name, channel_name) == 0) {
+      dest = channel;
+      if (out_idx != nullptr) {
+        *out_idx = idx;
+      }
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool MyMesh::sendTextToChannelNamed(const char* channel_name, const char* text, uint32_t timestamp, uint8_t* out_idx) {
+  ChannelDetails channel;
+  uint8_t channel_idx = 0xFF;
+  if (!getChannelByName(channel_name, channel, &channel_idx)) {
+    return false;
+  }
+
+  if (out_idx != nullptr) {
+    *out_idx = channel_idx;
+  }
+  return sendGroupMessage(timestamp, channel.channel, getNodeName(), text, strlen(text));
+}
+
+bool MyMesh::sendChannelDataToChannelNamed(const char* channel_name, uint16_t data_type, const uint8_t* data,
+                                           size_t data_len, uint8_t* out_idx) {
+  ChannelDetails channel;
+  uint8_t channel_idx = 0xFF;
+  if (!getChannelByName(channel_name, channel, &channel_idx)) {
+    return false;
+  }
+
+  if (out_idx != nullptr) {
+    *out_idx = channel_idx;
+  }
+
+  return sendGroupData(channel.channel, nullptr, OUT_PATH_UNKNOWN, data_type, data, static_cast<int>(data_len));
+}
+
+bool sendMeshTextToChannelNamed(MyMesh& mesh, const char* channel_name, const char* text, uint32_t timestamp,
+                                uint8_t* out_idx) {
+  return mesh.sendTextToChannelNamed(channel_name, text, timestamp, out_idx);
 }
 
 const char *MyMesh::getNodeName() {
@@ -2262,6 +2406,8 @@ void MyMesh::loop() {
     saveContacts();
     dirty_contacts_expiry = 0;
   }
+
+  file_transfer.loop(*this);
 
 #ifdef DISPLAY_CLASS
   if (_ui) _ui->setHasConnection(_serial->isConnected());

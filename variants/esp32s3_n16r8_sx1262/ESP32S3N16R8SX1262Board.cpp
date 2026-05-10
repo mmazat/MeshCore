@@ -8,17 +8,48 @@
 
 namespace {
 
+uint32_t crc32_update(uint32_t crc, const uint8_t* data, size_t len) {
+  crc = ~crc;
+  for (size_t i = 0; i < len; ++i) {
+    crc ^= data[i];
+    for (int bit = 0; bit < 8; ++bit) {
+      crc = (crc >> 1) ^ (0xEDB88320u & (-(int32_t)(crc & 1u)));
+    }
+  }
+  return ~crc;
+}
+
 framesize_t preferred_sensor_framesize(sensor_t* sensor) {
   if (sensor == nullptr) {
-    return FRAMESIZE_UXGA;
+    return FRAMESIZE_QQVGA;
   }
 
   const camera_sensor_info_t* info = esp_camera_sensor_get_info(&sensor->id);
   if (info == nullptr) {
-    return FRAMESIZE_UXGA;
+    return FRAMESIZE_QQVGA;
   }
 
-  return info->max_size;
+  return info->max_size < FRAMESIZE_QQVGA ? info->max_size : FRAMESIZE_QQVGA;
+}
+
+bool apply_preferred_sensor_framesize(sensor_t* sensor) {
+  if (sensor == nullptr) {
+    return false;
+  }
+
+  const framesize_t candidates[] = {
+      preferred_sensor_framesize(sensor),
+      FRAMESIZE_QQVGA,
+  };
+
+  for (framesize_t candidate : candidates) {
+    if (sensor->set_framesize(sensor, candidate) == ESP_OK) {
+      return true;
+    }
+  }
+
+  const camera_sensor_info_t* info = esp_camera_sensor_get_info(&sensor->id);
+  return info != nullptr && sensor->set_framesize(sensor, info->max_size) == ESP_OK;
 }
 
 bool init_camera() {
@@ -43,7 +74,7 @@ bool init_camera() {
   config.pin_reset = CAM_PIN_RESET;
   config.xclk_freq_hz = CAM_XCLK_FREQ_HZ;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size = FRAMESIZE_UXGA;
+  config.frame_size = FRAMESIZE_QQVGA;
   config.jpeg_quality = CAM_JPEG_QUALITY;
   config.fb_count = CAM_FB_COUNT;
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
@@ -62,8 +93,7 @@ bool init_camera() {
   }
 
   sensor_t* sensor = esp_camera_sensor_get();
-  framesize_t target_framesize = preferred_sensor_framesize(sensor);
-  if (sensor != nullptr && sensor->set_framesize(sensor, target_framesize) != ESP_OK) {
+  if (!apply_preferred_sensor_framesize(sensor)) {
     Serial.println("camera framesize switch failed");
   }
 
@@ -125,9 +155,16 @@ void ESP32S3N16R8SX1262Board::begin() {
 }
 
 bool ESP32S3N16R8SX1262Board::captureToSD(char* path_buffer, size_t path_buffer_size,
-                                         size_t* bytes_written) {
+                                         size_t* bytes_written,
+                                         uint16_t* out_width, uint16_t* out_height) {
   if (bytes_written != nullptr) {
     *bytes_written = 0;
+  }
+  if (out_width != nullptr) {
+    *out_width = 0;
+  }
+  if (out_height != nullptr) {
+    *out_height = 0;
   }
 
   if (!camera_online || path_buffer == nullptr || path_buffer_size == 0) {
@@ -157,6 +194,13 @@ bool ESP32S3N16R8SX1262Board::captureToSD(char* path_buffer, size_t path_buffer_
     return false;
   }
 
+  if (out_width != nullptr) {
+    *out_width = frame->width;
+  }
+  if (out_height != nullptr) {
+    *out_height = frame->height;
+  }
+
   size_t written = image.write(frame->buf, frame->len);
   image.flush();
   image.close();
@@ -176,6 +220,88 @@ bool ESP32S3N16R8SX1262Board::captureToSD(char* path_buffer, size_t path_buffer_
   }
 
   Serial.printf("capture saved: %s (%u bytes)\n", path_buffer, static_cast<unsigned>(written));
+  unmountSD();
+  return true;
+}
+
+bool ESP32S3N16R8SX1262Board::getSDFileSize(const char* path, size_t* file_size) {
+  if (file_size != nullptr) {
+    *file_size = 0;
+  }
+
+  if (path == nullptr || file_size == nullptr || !mountSD()) {
+    return false;
+  }
+
+  File file = SD_MMC.open(path, FILE_READ);
+  if (!file || file.isDirectory()) {
+    unmountSD();
+    return false;
+  }
+
+  *file_size = static_cast<size_t>(file.size());
+  file.close();
+  unmountSD();
+  return true;
+}
+
+bool ESP32S3N16R8SX1262Board::computeSDFileCRC32(const char* path, uint32_t* crc32_out) {
+  if (crc32_out != nullptr) {
+    *crc32_out = 0;
+  }
+
+  if (path == nullptr || crc32_out == nullptr || !mountSD()) {
+    return false;
+  }
+
+  File file = SD_MMC.open(path, FILE_READ);
+  if (!file || file.isDirectory()) {
+    unmountSD();
+    return false;
+  }
+
+  uint8_t buffer[256];
+  while (true) {
+    size_t bytes_read = file.read(buffer, sizeof(buffer));
+    if (bytes_read == 0) {
+      break;
+    }
+    *crc32_out = crc32_update(*crc32_out, buffer, bytes_read);
+    if (bytes_read < sizeof(buffer)) {
+      break;
+    }
+  }
+
+  file.close();
+  unmountSD();
+  return true;
+}
+
+bool ESP32S3N16R8SX1262Board::readSDFileChunk(const char* path, size_t offset, uint8_t* buffer,
+                                              size_t buffer_size, size_t* bytes_read) {
+  if (bytes_read != nullptr) {
+    *bytes_read = 0;
+  }
+
+  if (path == nullptr || buffer == nullptr || bytes_read == nullptr || buffer_size == 0 || !mountSD()) {
+    return false;
+  }
+
+  File file = SD_MMC.open(path, FILE_READ);
+  if (!file || file.isDirectory()) {
+    unmountSD();
+    return false;
+  }
+
+  bool seek_ok = file.seek(offset);
+  if (!seek_ok) {
+    file.close();
+    unmountSD();
+    return false;
+  }
+
+  *bytes_read = file.read(buffer, buffer_size);
+  file.close();
   unmountSD();
   return true;
 }
