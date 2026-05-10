@@ -1,7 +1,27 @@
 #include "MyMesh.h"
 
 #include <Arduino.h> // needed for PlatformIO
+#include <ctype.h>
 #include <Mesh.h>
+
+static const char *skipWhitespace(const char *text) {
+  while (*text != 0 && isspace((unsigned char)*text)) {
+    text++;
+  }
+  return text;
+}
+
+static bool isCaptureCommand(const char *text) {
+  const char *command = skipWhitespace(text);
+  if (strncmp(command, "!capture", 8) != 0) {
+    return false;
+  }
+
+  command = skipWhitespace(command + 8);
+  return *command == 0;
+}
+
+static const char *CAPTURE_REPLY_CHANNEL_NAME = "meshcore_gw";
 
 #define CMD_APP_START                 1
 #define CMD_SEND_TXT_MSG              2
@@ -545,6 +565,77 @@ void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packe
   uint8_t channel_idx = findChannelIdx(channel);
   out_frame[i++] = channel_idx;
   uint8_t path_len = out_frame[i++] = pkt->isRouteFlood() ? pkt->path_len : 0xFF;
+
+#if defined(ESP32_S3_N16R8_SX1262)
+  const char *command_text = text;
+  const char *sender_sep = strstr(text, ": ");
+  if (sender_sep != NULL) {
+    command_text = sender_sep + 2;
+  }
+
+  if (isCaptureCommand(command_text)) {
+    uint32_t response_timestamp = getRTCClock()->getCurrentTime();
+    char capture_path[48] = {0};
+    size_t bytes_written = 0;
+    bool capture_ok = board_capture_image_to_sd(capture_path, sizeof(capture_path), &bytes_written);
+    char reply_text[160];
+    snprintf(reply_text, sizeof(reply_text),
+             "capture success=%s write=%s bytes=%u path=%s",
+             capture_ok ? "true" : "false",
+             capture_ok ? "ok" : "failed",
+             static_cast<unsigned>(bytes_written),
+             capture_ok ? capture_path : "-");
+    mesh::GroupChannel reply_channel = channel;
+    uint8_t reply_channel_idx = channel_idx;
+    ChannelDetails reply_channel_details;
+
+    for (uint8_t idx = 0; idx < MAX_GROUP_CHANNELS; idx++) {
+      if (getChannel(idx, reply_channel_details)
+          && strcmp(reply_channel_details.name, CAPTURE_REPLY_CHANNEL_NAME) == 0) {
+        reply_channel = reply_channel_details.channel;
+        reply_channel_idx = idx;
+        break;
+      }
+    }
+
+    bool sent_reply = sendGroupMessage(response_timestamp, reply_channel, getNodeName(), reply_text,
+                                       strlen(reply_text));
+
+    if (sent_reply) {
+      char full_reply[128];
+      snprintf(full_reply, sizeof(full_reply), "%s: %s", getNodeName(), reply_text);
+
+      int ri = 0;
+      if (app_target_ver >= 3) {
+        out_frame[ri++] = RESP_CODE_CHANNEL_MSG_RECV_V3;
+        out_frame[ri++] = 0;
+        out_frame[ri++] = 0;
+        out_frame[ri++] = 0;
+      } else {
+        out_frame[ri++] = RESP_CODE_CHANNEL_MSG_RECV;
+      }
+      out_frame[ri++] = reply_channel_idx;
+      out_frame[ri++] = 0;
+      out_frame[ri++] = TXT_TYPE_PLAIN;
+      memcpy(&out_frame[ri], &response_timestamp, 4);
+      ri += 4;
+
+      int reply_len = strlen(full_reply);
+      if (ri + reply_len > MAX_FRAME_SIZE) {
+        reply_len = MAX_FRAME_SIZE - ri;
+      }
+      memcpy(&out_frame[ri], full_reply, reply_len);
+      ri += reply_len;
+      addToOfflineQueue(out_frame, ri);
+
+      if (_serial->isConnected()) {
+        uint8_t frame[1];
+        frame[0] = PUSH_CODE_MSG_WAITING;
+        _serial->writeFrame(frame, 1);
+      }
+    }
+  }
+#endif
 
   out_frame[i++] = TXT_TYPE_PLAIN;
   memcpy(&out_frame[i], &timestamp, 4);

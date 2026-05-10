@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include "target.h"
 
-ESP32Board board;
+ESP32S3N16R8SX1262Board board;
 
 static SPIClass spi;
 RADIO_CLASS radio = new Module(P_LORA_NSS, P_LORA_DIO_1, P_LORA_RESET, P_LORA_BUSY, spi);
@@ -24,6 +24,10 @@ bool radio_init() {
 
 uint32_t radio_get_rng_seed() {
   return radio.random(0x7FFFFFFF);
+}
+
+bool board_capture_image_to_sd(char* path_buffer, size_t path_buffer_size, size_t* bytes_written) {
+  return board.captureToSD(path_buffer, path_buffer_size, bytes_written);
 }
 
 void radio_set_params(float freq, float bw, uint8_t sf, uint8_t cr) {
