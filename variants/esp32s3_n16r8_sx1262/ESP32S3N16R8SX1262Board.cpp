@@ -19,38 +19,7 @@ uint32_t crc32_update(uint32_t crc, const uint8_t* data, size_t len) {
   return ~crc;
 }
 
-framesize_t preferred_sensor_framesize(sensor_t* sensor) {
-  if (sensor == nullptr) {
-    return FRAMESIZE_QQVGA;
-  }
 
-  const camera_sensor_info_t* info = esp_camera_sensor_get_info(&sensor->id);
-  if (info == nullptr) {
-    return FRAMESIZE_QQVGA;
-  }
-
-  return info->max_size < FRAMESIZE_QQVGA ? info->max_size : FRAMESIZE_QQVGA;
-}
-
-bool apply_preferred_sensor_framesize(sensor_t* sensor) {
-  if (sensor == nullptr) {
-    return false;
-  }
-
-  const framesize_t candidates[] = {
-      preferred_sensor_framesize(sensor),
-      FRAMESIZE_QQVGA,
-  };
-
-  for (framesize_t candidate : candidates) {
-    if (sensor->set_framesize(sensor, candidate) == ESP_OK) {
-      return true;
-    }
-  }
-
-  const camera_sensor_info_t* info = esp_camera_sensor_get_info(&sensor->id);
-  return info != nullptr && sensor->set_framesize(sensor, info->max_size) == ESP_OK;
-}
 
 bool init_camera() {
   camera_config_t config = {};
@@ -92,9 +61,12 @@ bool init_camera() {
     return false;
   }
 
+
   sensor_t* sensor = esp_camera_sensor_get();
-  if (!apply_preferred_sensor_framesize(sensor)) {
-    Serial.println("camera framesize switch failed");
+  if (sensor) {
+    if (sensor->set_framesize(sensor, FRAMESIZE_VGA) != ESP_OK) {
+      Serial.println("camera framesize switch to VGA failed");
+    }
   }
 
   return true;
