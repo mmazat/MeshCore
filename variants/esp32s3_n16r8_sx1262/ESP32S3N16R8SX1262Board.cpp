@@ -74,7 +74,7 @@ bool init_camera() {
   config.pin_reset = CAM_PIN_RESET;
   config.xclk_freq_hz = CAM_XCLK_FREQ_HZ;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size = FRAMESIZE_QQVGA;
+  config.frame_size = FRAMESIZE_VGA;
   config.jpeg_quality = CAM_JPEG_QUALITY;
   config.fb_count = CAM_FB_COUNT;
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
@@ -137,21 +137,17 @@ bool ESP32S3N16R8SX1262Board::mountSD() {
   return sd_online;
 }
 
-void ESP32S3N16R8SX1262Board::unmountSD() {
-  if (!sd_mounted) {
-    return;
-  }
 
-  SD_MMC.end();
-  sd_mounted = false;
+// SD card is never unmounted; keep initialized for the entire runtime.
+void ESP32S3N16R8SX1262Board::unmountSD() {
+  // No-op
 }
 
 void ESP32S3N16R8SX1262Board::begin() {
   ESP32Board::begin();
-
   camera_online = init_camera();
   sd_online = mountSD();
-  unmountSD();
+  // SD card remains mounted for the entire runtime
 }
 
 bool ESP32S3N16R8SX1262Board::captureToSD(char* path_buffer, size_t path_buffer_size,
@@ -220,7 +216,6 @@ bool ESP32S3N16R8SX1262Board::captureToSD(char* path_buffer, size_t path_buffer_
   }
 
   Serial.printf("capture saved: %s (%u bytes)\n", path_buffer, static_cast<unsigned>(written));
-  unmountSD();
   return true;
 }
 
@@ -235,13 +230,11 @@ bool ESP32S3N16R8SX1262Board::getSDFileSize(const char* path, size_t* file_size)
 
   File file = SD_MMC.open(path, FILE_READ);
   if (!file || file.isDirectory()) {
-    unmountSD();
     return false;
   }
 
   *file_size = static_cast<size_t>(file.size());
   file.close();
-  unmountSD();
   return true;
 }
 
@@ -256,7 +249,6 @@ bool ESP32S3N16R8SX1262Board::computeSDFileCRC32(const char* path, uint32_t* crc
 
   File file = SD_MMC.open(path, FILE_READ);
   if (!file || file.isDirectory()) {
-    unmountSD();
     return false;
   }
 
@@ -273,7 +265,6 @@ bool ESP32S3N16R8SX1262Board::computeSDFileCRC32(const char* path, uint32_t* crc
   }
 
   file.close();
-  unmountSD();
   return true;
 }
 
@@ -289,19 +280,16 @@ bool ESP32S3N16R8SX1262Board::readSDFileChunk(const char* path, size_t offset, u
 
   File file = SD_MMC.open(path, FILE_READ);
   if (!file || file.isDirectory()) {
-    unmountSD();
     return false;
   }
 
   bool seek_ok = file.seek(offset);
   if (!seek_ok) {
     file.close();
-    unmountSD();
     return false;
   }
 
   *bytes_read = file.read(buffer, buffer_size);
   file.close();
-  unmountSD();
   return true;
 }

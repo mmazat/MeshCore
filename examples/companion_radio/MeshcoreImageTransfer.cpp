@@ -317,7 +317,17 @@ void MeshcoreImageTransfer::maybeReportRetryAttempt(MyMesh& mesh) const {
 void MeshcoreImageTransfer::begin() {
   state_fs_->mkdir(kTransferDir);
   if (loadState() && state_.active != 0) {
-    appendLog("resume job=%s path=%s ack=%lu/%lu",
+    // After a restart the gateway may have lost its session state, so always
+    // re-do the start handshake.  Clearing start_acked forces sendStart() to
+    // be called first; last_acked_chunk is kept so chunks resume from the
+    // correct position after the gateway re-acks the start.
+    state_.start_acked = 0;
+    // Reset timing so the first loop tick doesn't fire a spurious retry report.
+    state_.last_attempt_millis = 0;
+    state_.last_attempt_timeout_millis = 0;
+    RetryPolicy::reset(state_.retry_state);
+    saveState();
+    appendLog("resume job=%s path=%s ack=%lu/%lu (re-handshake)",
               state_.job_id,
               state_.file_path,
               state_.last_acked_chunk == kNoChunkAcked ? 0ul : state_.last_acked_chunk + 1,
@@ -433,57 +443,65 @@ bool MeshcoreImageTransfer::handleDirectMessage(MyMesh& mesh, const char* text, 
 
   reply_text[0] = 0;
 
-  if (isCaptureCommand(text)) {
-    bool aborted_previous = false;
-    if (isActive()) {
-      aborted_previous = abort(mesh);
+  // Generic handler for any command starting with '!'
+  if (text && text[0] == '!') {
+    // Special handling for known commands
+    if (isCaptureCommand(text)) {
+      bool aborted_previous = false;
+      if (isActive()) {
+        aborted_previous = abort(mesh);
+      }
+
+      char capture_path[48] = {0};
+      size_t bytes_written = 0;
+      uint16_t img_width = 0;
+      uint16_t img_height = 0;
+      bool capture_ok = board_capture_image_to_sd(capture_path, sizeof(capture_path), &bytes_written,
+                                                  &img_width, &img_height);
+      bool transfer_started = false;
+      if (capture_ok) {
+        transfer_started = start(capture_path, response_timestamp, sender_name);
+      }
+
+      if (!capture_ok) {
+        snprintf(reply_text, reply_text_len,
+                 aborted_previous ? "aborted previous transfer, image capture failed"
+                                  : "image capture failed");
+      } else if (!transfer_started) {
+        snprintf(reply_text, reply_text_len,
+                 aborted_previous ? "aborted previous transfer, captured %s %ux%u %luB, transfer failed"
+                                  : "captured %s %ux%u %luB, transfer failed",
+                 capture_path, img_width, img_height, static_cast<unsigned long>(bytes_written));
+      } else {
+        snprintf(reply_text, reply_text_len,
+                 aborted_previous ? "aborted previous transfer, captured %s %ux%u %luB, transfer started to %s"
+                                  : "captured %s %ux%u %luB, transfer started to %s",
+                 capture_path, img_width, img_height, static_cast<unsigned long>(bytes_written),
+                 sender_name == nullptr ? "" : sender_name);
+      }
+      return true;
     }
 
-    char capture_path[48] = {0};
-    size_t bytes_written = 0;
-    uint16_t img_width = 0;
-    uint16_t img_height = 0;
-    bool capture_ok = board_capture_image_to_sd(capture_path, sizeof(capture_path), &bytes_written,
-                                                &img_width, &img_height);
-    bool transfer_started = false;
-    if (capture_ok) {
-      transfer_started = start(capture_path, response_timestamp, sender_name);
+    const char* sendfile_path = parseSendFileCommand(text);
+    if (sendfile_path != nullptr) {
+      bool transfer_started = start(sendfile_path, response_timestamp, sender_name);
+      snprintf(reply_text, reply_text_len,
+               "sendfile path=%s transfer=%s",
+               sendfile_path,
+               transfer_started ? "queued" : "busy-or-missing");
+      return true;
     }
 
-    if (!capture_ok) {
+    if (isAbortCommand(text)) {
+      bool was_active = abort(mesh);
       snprintf(reply_text, reply_text_len,
-               aborted_previous ? "aborted previous transfer, image capture failed"
-                                : "image capture failed");
-    } else if (!transfer_started) {
-      snprintf(reply_text, reply_text_len,
-               aborted_previous ? "aborted previous transfer, captured %s %ux%u %luB, transfer failed"
-                                : "captured %s %ux%u %luB, transfer failed",
-               capture_path, img_width, img_height, static_cast<unsigned long>(bytes_written));
-    } else {
-      snprintf(reply_text, reply_text_len,
-               aborted_previous ? "aborted previous transfer, captured %s %ux%u %luB, transfer started to %s"
-                                : "captured %s %ux%u %luB, transfer started to %s",
-               capture_path, img_width, img_height, static_cast<unsigned long>(bytes_written),
-               sender_name == nullptr ? "" : sender_name);
+               "abort transfer=%s",
+               was_active ? "aborted" : "none");
+      return true;
     }
-    return true;
-  }
 
-  const char* sendfile_path = parseSendFileCommand(text);
-  if (sendfile_path != nullptr) {
-    bool transfer_started = start(sendfile_path, response_timestamp, sender_name);
-    snprintf(reply_text, reply_text_len,
-             "sendfile path=%s transfer=%s",
-             sendfile_path,
-             transfer_started ? "queued" : "busy-or-missing");
-    return true;
-  }
-
-  if (isAbortCommand(text)) {
-    bool was_active = abort(mesh);
-    snprintf(reply_text, reply_text_len,
-             "abort transfer=%s",
-             was_active ? "aborted" : "none");
+    // Generic ACK for any other !command
+    snprintf(reply_text, reply_text_len, "ACK %s", text);
     return true;
   }
 
@@ -543,6 +561,12 @@ bool MeshcoreImageTransfer::handleProtocolMessage(const char* text, const char* 
                 static_cast<unsigned long>(state_.total_chunks));
       if (state_.last_acked_chunk + 1 >= state_.total_chunks) {
         appendLog("complete job=%s path=%s, clearing and resetting state", state_.job_id, state_.file_path);
+        // Free RAM buffer before clearing state
+        if (image_buffer_) {
+          free(image_buffer_);
+          image_buffer_ = nullptr;
+          image_buffer_size_ = 0;
+        }
         clearState();
         // Extra: reload and log state to confirm reset
         bool loaded = loadState();
@@ -815,11 +839,10 @@ bool MeshcoreImageTransfer::sendChunk(MyMesh& mesh) {
   return sent;
 }
 
-bool MeshcoreImageTransfer::readChunk(uint32_t chunk_idx, uint8_t* buffer, size_t* bytes_read) const {
+bool MeshcoreImageTransfer::readChunk(uint32_t chunk_idx, uint8_t* buffer, size_t* bytes_read) {
   if (bytes_read == nullptr) {
     return false;
   }
-
   *bytes_read = 0;
 
   if (!kLocalImageCaptureSupported) {
@@ -828,8 +851,41 @@ bool MeshcoreImageTransfer::readChunk(uint32_t chunk_idx, uint8_t* buffer, size_
     return false;
   }
 
+  // RAM-caching logic
+  if (image_buffer_ == nullptr) {
+    // Allocate and load image into RAM
+    if (state_.file_size == 0) {
+      appendLog("ram-cache: file_size is 0");
+      return false;
+    }
+    uint8_t* new_buf = (uint8_t*)malloc(state_.file_size);
+    if (!new_buf) {
+      appendLog("ram-cache: malloc failed for %lu bytes", static_cast<unsigned long>(state_.file_size));
+      return false;
+    }
+    size_t total_read = 0;
+    bool ok = board_read_sd_file_chunk(state_.file_path, 0, new_buf, state_.file_size, &total_read);
+    if (!ok || total_read != state_.file_size) {
+      appendLog("ram-cache: failed to read file to RAM (%lu/%lu)", static_cast<unsigned long>(total_read), static_cast<unsigned long>(state_.file_size));
+      free(new_buf);
+      return false;
+    }
+    image_buffer_ = new_buf;
+    image_buffer_size_ = state_.file_size;
+    appendLog("ram-cache: loaded %lu bytes into RAM", static_cast<unsigned long>(state_.file_size));
+  }
+
+  // Serve chunk from RAM
   size_t offset = static_cast<size_t>(chunk_idx) * state_.chunk_size;
-  return board_read_sd_file_chunk(state_.file_path, offset, buffer, state_.chunk_size, bytes_read);
+  if (offset >= image_buffer_size_) {
+    appendLog("ram-cache: chunk offset out of range (%lu/%lu)", static_cast<unsigned long>(offset), static_cast<unsigned long>(image_buffer_size_));
+    return false;
+  }
+  size_t remain = image_buffer_size_ - offset;
+  size_t to_copy = remain < state_.chunk_size ? remain : state_.chunk_size;
+  memcpy(buffer, image_buffer_ + offset, to_copy);
+  *bytes_read = to_copy;
+  return true;
 }
 
 bool MeshcoreImageTransfer::abort(MyMesh& mesh) {
@@ -848,6 +904,12 @@ bool MeshcoreImageTransfer::abort(MyMesh& mesh) {
     mesh.sendMessage(*recipient, mesh.getRTCClock()->getCurrentTime(), 0, message, expected_ack, est_timeout);
   }
   appendLog("user-abort job=%s", state_.job_id);
+  // Free RAM buffer before clearing state
+  if (image_buffer_) {
+    free(image_buffer_);
+    image_buffer_ = nullptr;
+    image_buffer_size_ = 0;
+  }
   clearState();
   return true;
 }
@@ -863,6 +925,12 @@ bool MeshcoreImageTransfer::computeCRC32(const char* file_path, uint32_t* crc32_
 }
 
 void MeshcoreImageTransfer::resetState() {
+  // Free RAM buffer if allocated
+  if (image_buffer_) {
+    free(image_buffer_);
+    image_buffer_ = nullptr;
+    image_buffer_size_ = 0;
+  }
   memset(&state_, 0, sizeof(state_));
   state_.magic = kStateMagic;
   state_.version = kStateVersion;

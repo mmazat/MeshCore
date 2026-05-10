@@ -10,6 +10,7 @@ class ESP32S3N16R8SX1262Board : public ESP32Board {
   bool sd_mounted = false;
 
   bool mountSD();
+  // SD card is always mounted after boot; unmountSD is a no-op
   void unmountSD();
 
 public:

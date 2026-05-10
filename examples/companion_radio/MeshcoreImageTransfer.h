@@ -21,6 +21,10 @@ public:
   bool isActive() const { return state_.active != 0; }
 
 private:
+  // RAM-caching buffer for image data
+  uint8_t* image_buffer_ = nullptr;
+  size_t image_buffer_size_ = 0;
+
   struct RetryState {
     uint8_t quick_retry_attempts;
     uint8_t slow_retry_attempts;
@@ -60,7 +64,7 @@ private:
   void reportLocalStatus(MyMesh& mesh, const char* text) const;
   bool sendStart(MyMesh& mesh);
   bool sendChunk(MyMesh& mesh);
-  bool readChunk(uint32_t chunk_idx, uint8_t* buffer, size_t* bytes_read) const;
+  bool readChunk(uint32_t chunk_idx, uint8_t* buffer, size_t* bytes_read);
   bool computeCRC32(const char* file_path, uint32_t* crc32_out) const;
   void resetState();
 
