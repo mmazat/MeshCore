@@ -636,7 +636,9 @@ void MyMesh::onMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t 
   if (file_transfer.handleDirectMessage(*this, text, from.name, response_timestamp,
                                         reply_text, sizeof(reply_text))) {
     queueMessage(from, TXT_TYPE_PLAIN, pkt, sender_timestamp, NULL, 0, text);
-    queueMessage(from, TXT_TYPE_PLAIN, pkt, sender_timestamp, NULL, 0, reply_text);
+    if (reply_text[0] != 0) {
+      queueMessage(from, TXT_TYPE_PLAIN, pkt, sender_timestamp, NULL, 0, reply_text);
+    }
     return;
   }
 #endif
@@ -696,6 +698,16 @@ void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packe
   }
 
   if (file_transfer.handleProtocolMessage(command_text, sender_name)) {
+    return;
+  }
+
+  uint32_t response_timestamp = getRTCClock()->getCurrentTime();
+  char reply_text[160];
+  if (file_transfer.handleDirectMessage(*this, command_text, sender_name, response_timestamp,
+                                        reply_text, sizeof(reply_text))) {
+    if (reply_text[0] != 0) {
+      queueLocalPlainMessage(reply_text, timestamp);
+    }
     return;
   }
 #endif

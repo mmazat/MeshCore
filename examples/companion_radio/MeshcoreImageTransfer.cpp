@@ -463,10 +463,12 @@ bool MeshcoreImageTransfer::handleDirectMessage(MyMesh& mesh, const char* text, 
 
   reply_text[0] = 0;
 
+  const char* command = text == nullptr ? nullptr : skipWhitespace(text);
+
   // Generic handler for any command starting with '!'
-  if (text && text[0] == '!') {
+  if (command && command[0] == '!') {
     // Special handling for known commands
-    if (isCaptureCommand(text)) {
+    if (isCaptureCommand(command)) {
       bool aborted_previous = false;
       if (isActive()) {
         aborted_previous = abort(mesh);
@@ -502,7 +504,7 @@ bool MeshcoreImageTransfer::handleDirectMessage(MyMesh& mesh, const char* text, 
       return true;
     }
 
-    const char* sendfile_path = parseSendFileCommand(text);
+    const char* sendfile_path = parseSendFileCommand(command);
     if (sendfile_path != nullptr) {
       bool transfer_started = start(sendfile_path, response_timestamp, sender_name);
       snprintf(reply_text, reply_text_len,
@@ -512,7 +514,7 @@ bool MeshcoreImageTransfer::handleDirectMessage(MyMesh& mesh, const char* text, 
       return true;
     }
 
-    if (isAbortCommand(text)) {
+    if (isAbortCommand(command)) {
       bool was_active = abort(mesh);
       snprintf(reply_text, reply_text_len,
                "abort transfer=%s",
@@ -520,8 +522,7 @@ bool MeshcoreImageTransfer::handleDirectMessage(MyMesh& mesh, const char* text, 
       return true;
     }
 
-    // Generic ACK for any other !command
-    snprintf(reply_text, reply_text_len, "ACK %s", text);
+    // Consume unknown !commands without forcing an ACK-style reply.
     return true;
   }
 
