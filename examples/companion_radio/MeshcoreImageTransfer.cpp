@@ -67,7 +67,7 @@ size_t encodeBase64(const uint8_t* input, size_t input_len, char* output, size_t
       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
   size_t output_len = 4 * ((input_len + 2) / 3);
-  if (output_size <= output_len) {
+  if (output_size < output_len + 1) {  // Need space for base64 data + null terminator
     return 0;
   }
 
