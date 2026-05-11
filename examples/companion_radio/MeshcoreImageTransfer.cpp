@@ -19,7 +19,11 @@ constexpr bool kLocalImageCaptureSupported = false;
 constexpr uint32_t kStateMagic = 0x31524654; // TFR1
 constexpr uint16_t kStateVersion = 7;
 constexpr uint32_t kNoChunkAcked = 0xFFFFFFFFu;
-constexpr size_t kRawChunkBytes = 96;
+// MAX_FRAME_SIZE=172, V3 contact msg header=16 bytes → 156 bytes for text.
+// Message format: "@img1|d|<16>|<idx>|<b64>" prefix = 8+16+1+5+1=31 chars worst-case.
+// 156-31=125 → floor to multiple of 4 → 124 base64 chars → 93 raw bytes.
+// 93 % 3 == 0 so no padding chars needed.
+constexpr size_t kRawChunkBytes = 93;
 constexpr unsigned long kMinAckWaitMillis = 30000;
 constexpr unsigned long kQuickRetryIntervalMs = 5000;
 constexpr unsigned long kSlowRetryIntervalMs = 60000;
@@ -781,7 +785,7 @@ bool MeshcoreImageTransfer::sendChunk(MyMesh& mesh) {
   }
 
   // Encode chunk as text: @img1|d|<job_id>|<chunk_idx>|<base64_data>
-  char b64_buf[132]; // ceil(96*4/3)+1
+  char b64_buf[128]; // ceil(93*4/3)+1 = 124+1=125, padded to 128
   size_t b64_len = encodeBase64(raw, bytes_read, b64_buf, sizeof(b64_buf));
   if (b64_len == 0) {
     appendLog("chunk-encode-failed job=%s idx=%lu", state_.job_id, static_cast<unsigned long>(next_chunk));
