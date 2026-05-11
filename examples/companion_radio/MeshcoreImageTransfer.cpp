@@ -24,9 +24,9 @@ constexpr uint32_t kNoChunkAcked = 0xFFFFFFFFu;
 // 156-31=125 → floor to multiple of 4 → 124 base64 chars → 93 raw bytes.
 // 93 % 3 == 0 so no padding chars needed.
 constexpr size_t kRawChunkBytes = 93;
-constexpr unsigned long kMinAckWaitMillis = 30000;
-constexpr unsigned long kQuickRetryIntervalMs = 5000;
-constexpr unsigned long kSlowRetryIntervalMs = 60000;
+constexpr unsigned long kMinAckWaitMillis = 30000;  // wait up to 30s for mesh delivery + ACK
+constexpr unsigned long kQuickRetryIntervalMs = 5000;  // retry quickly after a lost ACK
+constexpr unsigned long kSlowRetryIntervalMs = 60000;  // slow retry at 1 minute intervals
 constexpr uint8_t kQuickRetryAttempts = 3;
 constexpr uint8_t kSlowRetryAttempts = 3;
 constexpr char kTransferDir[] = "/imgtx";
@@ -399,20 +399,30 @@ void MeshcoreImageTransfer::loop(MyMesh& mesh) {
   }
 
   unsigned long now = millis();
+  // Detailed logging for every loop call when transfer is active
+  bool is_sending_start = (state_.start_acked == 0);
+  
   if (state_.last_attempt_millis != 0) {
     unsigned long ack_wait_millis = state_.last_attempt_timeout_millis == 0
                                         ? kMinAckWaitMillis
                                         : state_.last_attempt_timeout_millis;
     unsigned long elapsed = now - state_.last_attempt_millis;
     if (elapsed < ack_wait_millis) {
-      return;
+      appendLog("loop-throttle-ack job=%s is_start=%u elapsed=%lu wait=%lu", 
+                state_.job_id, is_sending_start, elapsed, ack_wait_millis);
+      return;  // Still waiting for ACK
     }
 
     unsigned long retry_delay = RetryPolicy::currentDelayMillis(state_.retry_state);
     if (elapsed < ack_wait_millis + retry_delay) {
-      return;
+      appendLog("loop-throttle-retry job=%s is_start=%u elapsed=%lu delay=%lu", 
+                state_.job_id, is_sending_start, elapsed, retry_delay);
+      return;  // Waiting for retry interval before next attempt
     }
   }
+
+  appendLog("loop-attempt job=%s is_start=%u last_attempt=%lu now=%lu", 
+            state_.job_id, is_sending_start, state_.last_attempt_millis, now);
 
   maybeReportRetryAttempt(mesh);
   bool sent = false;
@@ -420,6 +430,8 @@ void MeshcoreImageTransfer::loop(MyMesh& mesh) {
     sent = sendStart(mesh);
     if (!sent) {
       appendLog("sendStart failed: job=%s target=%s", state_.job_id, state_.direct_target_name);
+    } else {
+      appendLog("loop-sending-start job=%s attempt_timeout=%lums", state_.job_id, state_.last_attempt_timeout_millis);
     }
   } else {
     sent = sendChunk(mesh);
@@ -428,13 +440,17 @@ void MeshcoreImageTransfer::loop(MyMesh& mesh) {
                 state_.last_acked_chunk == kNoChunkAcked ? 0ul : state_.last_acked_chunk + 1,
                 state_.total_chunks,
                 state_.direct_target_name);
+    } else {
+      appendLog("loop-sending-chunk job=%s idx=%lu/%lu", state_.job_id,
+                state_.last_acked_chunk == kNoChunkAcked ? 0ul : state_.last_acked_chunk + 1,
+                state_.total_chunks);
     }
   }
   if (sent) {
     state_.last_attempt_millis = now;
     RetryPolicy::noteAttempt(state_.retry_state);
     saveState();
-    delay(1000); // Pace the camera sender to 1 second between packets
+    // Don't block here - let the next loop iteration check timing naturally
   }
 }
 
@@ -765,6 +781,11 @@ bool MeshcoreImageTransfer::sendStart(MyMesh& mesh) {
 
 bool MeshcoreImageTransfer::sendChunk(MyMesh& mesh) {
   uint32_t next_chunk = state_.last_acked_chunk == kNoChunkAcked ? 0 : state_.last_acked_chunk + 1;
+  appendLog("sendChunk-entry job=%s next=%lu total=%lu target=%s", state_.job_id,
+            static_cast<unsigned long>(next_chunk),
+            static_cast<unsigned long>(state_.total_chunks),
+            state_.direct_target_name[0] != 0 ? state_.direct_target_name : "(none)");
+  
   if (next_chunk >= state_.total_chunks) {
     clearState();
     return false;

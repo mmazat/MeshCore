@@ -608,6 +608,16 @@ void MyMesh::onMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t 
   markConnectionActive(from); // in case this is from a server, and we have a connection
 
 #if defined(ESP32_S3_N16R8_SX1262)
+  // Handle gateway diagnostic messages
+  if (text && strncmp(text, "gw-diag|", 8) == 0) {
+    const char* diag_msg = text + 8;
+    char formatted[128];
+    snprintf(formatted, sizeof(formatted), "[GW] %s", diag_msg);
+    Serial.println(formatted);
+    queueMessage(from, TXT_TYPE_PLAIN, pkt, sender_timestamp, NULL, 0, formatted);
+    return;
+  }
+
   // Handle @img1| protocol acks arriving as direct messages (e.g. from meshcore_gw)
   char ble_progress_text[96];
   bool have_ble_progress = file_transfer.formatBleProgressMessage(text, ble_progress_text, sizeof(ble_progress_text));
