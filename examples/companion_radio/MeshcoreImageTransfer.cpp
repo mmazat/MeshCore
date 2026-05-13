@@ -1,8 +1,13 @@
 #include "MeshcoreImageTransfer.h"
 
 #include <stdarg.h>
+#include <time.h>
 
 #include <target.h>
+
+#if defined(ESP32_S3_N16R8_SX1262)
+#include <SD_MMC.h>
+#endif
 
 #include <helpers/TxtDataHelpers.h>
 
@@ -508,6 +513,7 @@ bool MeshcoreImageTransfer::handleDirectMessage(MyMesh& mesh, const char* text, 
     }
 
     if (isAbortCommand(command)) {
+      appendLog("!abort command received from %s", sender_name ? sender_name : "(unknown)");
       bool was_active = abort(mesh);
       snprintf(reply_text, reply_text_len,
                "abort transfer=%s",
@@ -582,6 +588,8 @@ bool MeshcoreImageTransfer::handleProtocolMessage(const char* text, const char* 
           image_buffer_size_ = 0;
         }
         clearState();
+        // Copy logs to SD card after successful transfer
+        copyLogsToSDCard();
         // Extra: reload and log state to confirm reset
         bool loaded = loadState();
         appendLog("post-complete state.active=%u job_id=%s", state_.active, state_.job_id);
@@ -930,7 +938,90 @@ bool MeshcoreImageTransfer::abort(MyMesh& mesh) {
     image_buffer_size_ = 0;
   }
   clearState();
+
+  // Copy logs to SD card after abort
+  copyLogsToSDCard();
   return true;
+}
+// Copy /imgtx logs to a timestamped folder on the SD card
+void MeshcoreImageTransfer::copyLogsToSDCard() {
+#if defined(ESP32_S3_N16R8_SX1262)
+  const char* src_dir = "/imgtx";
+
+  // Force filesystem metadata and buffered log data out before taking the copy snapshot.
+  File log_file = openAppendFile(state_fs_, kLogPath);
+  if (log_file) {
+    log_file.flush();
+    log_file.close();
+  }
+
+  // Build timestamped destination directory path
+  time_t now_t = time(nullptr);
+  struct tm tm_now;
+  localtime_r(&now_t, &tm_now);
+  char ts[20];
+  strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", &tm_now);
+  char dest_dir[64];
+  snprintf(dest_dir, sizeof(dest_dir), "/imgtx_aborted/%s", ts);
+
+  appendLog("copy-logs-start src=%s dest=%s", src_dir, dest_dir);
+
+  // Create parent and destination directories on SD card
+  if (!SD_MMC.exists("/imgtx_aborted")) {
+    SD_MMC.mkdir("/imgtx_aborted");
+  }
+  if (!SD_MMC.mkdir(dest_dir)) {
+    appendLog("copy-logs-mkdir-failed dest=%s", dest_dir);
+    return;
+  }
+
+  File src = state_fs_->open(src_dir);
+  if (!src || !src.isDirectory()) {
+    appendLog("copy-logs-open-src-failed src=%s", src_dir);
+    return;
+  }
+
+  int copied = 0;
+  int failed = 0;
+  uint8_t copy_buf[256];
+  File entry = src.openNextFile();
+  while (entry) {
+    if (!entry.isDirectory()) {
+      // entry.name() returns full path on ESP32 LittleFS e.g. "/imgtx/tx.log"
+      const char* full_name = entry.name();
+      const char* slash = strrchr(full_name, '/');
+      const char* fname = (slash != nullptr) ? slash + 1 : full_name;
+      char dest_path[96];
+      snprintf(dest_path, sizeof(dest_path), "%s/%s", dest_dir, fname);
+
+      File dest = SD_MMC.open(dest_path, FILE_WRITE);
+      if (dest) {
+        // entry.available() is unreliable on ESP32 LittleFS — use size() instead.
+        entry.seek(0);
+        size_t remaining = entry.size();
+        while (remaining > 0) {
+          size_t to_read = remaining < sizeof(copy_buf) ? remaining : sizeof(copy_buf);
+          size_t n = entry.read(copy_buf, to_read);
+          if (n == 0) break;
+          dest.write(copy_buf, n);
+          remaining -= n;
+        }
+        dest.flush();
+        dest.close();
+        appendLog("copy-logs-file-ok src=%s dest=%s size=%u", full_name, dest_path, (unsigned)entry.size());
+        copied++;
+      } else {
+        appendLog("copy-logs-file-failed dest=%s", dest_path);
+        failed++;
+      }
+    }
+    entry.close();
+    entry = src.openNextFile();
+  }
+  src.close();
+
+  appendLog("copy-logs-done copied=%d failed=%d dest=%s", copied, failed, dest_dir);
+#endif
 }
 
 bool MeshcoreImageTransfer::computeCRC32(const char* file_path, uint32_t* crc32_out) const {
