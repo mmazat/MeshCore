@@ -408,21 +408,14 @@ void MeshcoreImageTransfer::loop(MyMesh& mesh) {
                                         : state_.last_attempt_timeout_millis;
     unsigned long elapsed = now - state_.last_attempt_millis;
     if (elapsed < ack_wait_millis) {
-      appendLog("loop-throttle-ack job=%s is_start=%u elapsed=%lu wait=%lu", 
-                state_.job_id, is_sending_start, elapsed, ack_wait_millis);
       return;  // Still waiting for ACK
     }
 
     unsigned long retry_delay = RetryPolicy::currentDelayMillis(state_.retry_state);
     if (elapsed < ack_wait_millis + retry_delay) {
-      appendLog("loop-throttle-retry job=%s is_start=%u elapsed=%lu delay=%lu", 
-                state_.job_id, is_sending_start, elapsed, retry_delay);
       return;  // Waiting for retry interval before next attempt
     }
   }
-
-  appendLog("loop-attempt job=%s is_start=%u last_attempt=%lu now=%lu", 
-            state_.job_id, is_sending_start, state_.last_attempt_millis, now);
 
   maybeReportRetryAttempt(mesh);
   bool sent = false;
