@@ -760,7 +760,7 @@ bool MeshcoreImageTransfer::sendStart(MyMesh& mesh) {
       expected_ack,
       est_timeout) != MSG_SEND_FAILED;
   if (sent) {
-    state_.last_attempt_timeout_millis = est_timeout < kMinAckWaitMillis ? kMinAckWaitMillis : est_timeout;
+    state_.last_attempt_timeout_millis = kMinAckWaitMillis;
   }
   if (sent) {
     appendLog("send-start-direct job=%s via=%s", state_.job_id, recipient->name);
@@ -837,7 +837,7 @@ bool MeshcoreImageTransfer::sendChunk(MyMesh& mesh) {
       expected_ack,
       est_timeout) != MSG_SEND_FAILED;
   if (sent) {
-    state_.last_attempt_timeout_millis = est_timeout < kMinAckWaitMillis ? kMinAckWaitMillis : est_timeout;
+    state_.last_attempt_timeout_millis = kMinAckWaitMillis;
   }
   if (sent) {
     appendLog("send-chunk job=%s idx=%lu bytes=%u via=%s", state_.job_id,
