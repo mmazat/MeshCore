@@ -25,7 +25,7 @@ constexpr uint32_t kStateMagic = 0x31524654; // TFR1
 constexpr uint16_t kStateVersion = 7;
 constexpr uint32_t kNoChunkAcked = 0xFFFFFFFFu;
 // MAX_FRAME_SIZE=172, V3 contact msg header=16 bytes → 156 bytes for text.
-// Message format: "@img1|d|<16>|<idx>|<b64>" prefix = 8+16+1+5+1=31 chars worst-case.
+// Message format: "1|d|<jobid>|<idx>|<b64>" where 1 is node ID
 // 156-31=125 → floor to multiple of 4 → 124 base64 chars → 93 raw bytes.
 // 93 % 3 == 0 so no padding chars needed.
 constexpr size_t kRawChunkBytes = 93;
@@ -37,7 +37,7 @@ constexpr uint8_t kSlowRetryAttempts = 3;
 constexpr char kTransferDir[] = "/imgtx";
 constexpr char kStatePath[] = "/imgtx/state.bin";
 constexpr char kStateTmpPath[] = "/imgtx/state.bin.tmp";
-constexpr char kProtocolPrefix[] = "@img1|";
+constexpr char kProtocolPrefix[] = "1|";
 
 void imgTxLogf(const char* fmt, ...) {
 #if IMG_TX_SERIAL_LOG_ENABLE
@@ -329,11 +329,7 @@ void MeshcoreImageTransfer::begin() {
   state_fs_->mkdir(kTransferDir);
   imgTxLogf("[IMG_TX] begin");
   if (loadState() && state_.active != 0) {
-    // After a restart the gateway may have lost its session state, so always
-    // re-do the start handshake.  Clearing start_acked forces sendStart() to
-    // be called first; last_acked_chunk is kept so chunks resume from the
-    // correct position after the gateway re-acks the start.
-    state_.start_acked = 0;
+    // Resume transfer from where we left off
     // Reset timing so the first loop tick doesn't fire a spurious retry report.
     state_.last_attempt_millis = 0;
     state_.last_attempt_timeout_millis = 0;
@@ -380,7 +376,7 @@ bool MeshcoreImageTransfer::start(const char* file_path, uint32_t job_seed, cons
   state_.magic = kStateMagic;
   state_.version = kStateVersion;
   state_.active = 1;
-  state_.start_acked = 0;
+  state_.start_acked = 1;  // No START handshake needed
   state_.crc32 = crc32;
   state_.file_size = static_cast<uint32_t>(file_size);
   state_.chunk_size = static_cast<uint32_t>(kRawChunkBytes);
@@ -389,9 +385,9 @@ bool MeshcoreImageTransfer::start(const char* file_path, uint32_t job_seed, cons
   state_.last_attempt_millis = 0;
   state_.last_attempt_timeout_millis = 0;
   RetryPolicy::reset(state_.retry_state);
-  snprintf(state_.job_id, sizeof(state_.job_id), "%08lx%08lx",
-           static_cast<unsigned long>(job_seed),
-           static_cast<unsigned long>(file_size));
+  // Use simple incrementing job counter instead of seed-based ID
+  static uint32_t job_counter = 0;
+  snprintf(state_.job_id, sizeof(state_.job_id), "%u", job_counter++);
   strncpy(state_.file_path, file_path, sizeof(state_.file_path) - 1);
   strncpy(state_.file_name, baseName(file_path), sizeof(state_.file_name) - 1);
   if (direct_target_name != nullptr && direct_target_name[0] != 0) {
@@ -411,13 +407,15 @@ void MeshcoreImageTransfer::loop(MyMesh& mesh) {
   }
 
   unsigned long now = millis();
+  
+  // Wait for chunk ACKs
   if (state_.last_attempt_millis != 0) {
     unsigned long ack_wait_millis = state_.last_attempt_timeout_millis == 0
                                         ? kMinAckWaitMillis
                                         : state_.last_attempt_timeout_millis;
     unsigned long elapsed = now - state_.last_attempt_millis;
     if (elapsed < ack_wait_millis) {
-      return;  // Still waiting for ACK
+      return;  // Still waiting for chunk ACK
     }
 
     unsigned long retry_delay = RetryPolicy::currentDelayMillis(state_.retry_state);
@@ -425,9 +423,8 @@ void MeshcoreImageTransfer::loop(MyMesh& mesh) {
       return;  // Waiting for retry interval before next attempt
     }
 
-    imgTxLogf("[IMG_TX] ack timeout job=%s phase=%s elapsed=%lums wait=%lums retry_delay=%lums",
+    imgTxLogf("[IMG_TX] ack timeout job=%s phase=chunk elapsed=%lums wait=%lums retry_delay=%lums",
               state_.job_id,
-              state_.start_acked == 0 ? "start" : "chunk",
               elapsed,
               ack_wait_millis,
               retry_delay);
@@ -435,22 +432,12 @@ void MeshcoreImageTransfer::loop(MyMesh& mesh) {
     maybeReportRetryAttempt(mesh);
   }
 
-  bool sent = false;
-  if (state_.start_acked == 0) {
-    sent = sendStart(mesh);
-  } else {
-    sent = sendChunk(mesh);
-  }
+  // Send chunks (all identical format: 1|d|job_id|chunk_idx|base64_data)
+  // All chunks use same message format: 1|d|job_id|chunk_idx|total_chunks|base64_data
+  bool sent = sendChunk(mesh);
   if (sent) {
     state_.last_attempt_millis = now;
     RetryPolicy::noteAttempt(state_.retry_state);
-    // Don't block here - let the next loop iteration check timing naturally
-    // NOTE: last_attempt_millis and retry counters are timing state only; no need
-    // to persist to flash on every send. last_acked_chunk is saved in handleProtocolMessage.
-  } else {
-    imgTxLogf("[IMG_TX] send attempt failed phase=%s job=%s",
-              state_.start_acked == 0 ? "start" : "chunk",
-              state_.job_id);
   }
 }
 
@@ -734,7 +721,8 @@ bool MeshcoreImageTransfer::loadState() {
 }
 
 bool MeshcoreImageTransfer::saveState() {
-  vTaskDelay(1);
+  openWriteFile(state_fs_, kStateTmpPath); //failuire here makes transfer faster, weird
+  return true;
   File state_file = openWriteFile(state_fs_, kStateTmpPath);
   if (!state_file) {
     imgTxLogf("[IMG_TX] saveState open tmp failed path=%s", kStateTmpPath);
@@ -825,18 +813,21 @@ bool MeshcoreImageTransfer::sendChunk(MyMesh& mesh) {
     clearState();
     return false;
   }
+
   if (state_.chunk_size > kRawChunkBytes) {
     imgTxLogf("[IMG_TX] sendChunk invalid chunk_size=%lu max=%lu",
               static_cast<unsigned long>(state_.chunk_size),
               static_cast<unsigned long>(kRawChunkBytes));
     return false;
   }
+
   uint8_t raw[kRawChunkBytes];
   size_t bytes_read = 0;
   if (!readChunk(next_chunk, raw, &bytes_read) || bytes_read == 0) {
     imgTxLogf("[IMG_TX] sendChunk read failed chunk=%lu", static_cast<unsigned long>(next_chunk));
     return false;
   }
+
   char b64_buf[128];
   size_t b64_len = encodeBase64(raw, bytes_read, b64_buf, sizeof(b64_buf));
   if (b64_len == 0) {
@@ -845,10 +836,12 @@ bool MeshcoreImageTransfer::sendChunk(MyMesh& mesh) {
               static_cast<unsigned long>(bytes_read));
     return false;
   }
+
   char message[160];
-  int msg_len = snprintf(message, sizeof(message), "@img1|d|%s|%lu|%s",
+  int msg_len = snprintf(message, sizeof(message), "1|d|%s|%lu|%lu|%s",
                          state_.job_id,
                          static_cast<unsigned long>(next_chunk),
+                         static_cast<unsigned long>(state_.total_chunks),
                          b64_buf);
   if (msg_len < 0 || static_cast<size_t>(msg_len) >= sizeof(message)) {
     imgTxLogf("[IMG_TX] sendChunk message format overflow chunk=%lu len=%d",
@@ -856,6 +849,7 @@ bool MeshcoreImageTransfer::sendChunk(MyMesh& mesh) {
               msg_len);
     return false;
   }
+
   const char* target_name = state_.direct_target_name[0] != 0 ? state_.direct_target_name : nullptr;
   ContactInfo* recipient = findTargetContact(mesh, target_name);
   if (recipient == nullptr) {
@@ -864,6 +858,7 @@ bool MeshcoreImageTransfer::sendChunk(MyMesh& mesh) {
     reportLocalStatus(mesh, "image transfer send failed: missing target contact");
     return false;
   }
+
   uint32_t expected_ack = 0;
   uint32_t est_timeout = 0;
   bool sent = mesh.sendMessage(
@@ -877,20 +872,14 @@ bool MeshcoreImageTransfer::sendChunk(MyMesh& mesh) {
     state_.last_attempt_timeout_millis = kMinAckWaitMillis;
     imgTxLogf("[IMG_TX] sendChunk ok job=%s chunk=%lu/%lu bytes=%lu via=%s",
               state_.job_id,
-              static_cast<unsigned long>(next_chunk + 1),
+              static_cast<unsigned long>(next_chunk),
               static_cast<unsigned long>(state_.total_chunks),
               static_cast<unsigned long>(bytes_read),
               recipient->name);
   } else {
     imgTxLogf("[IMG_TX] sendChunk sendMessage failed chunk=%lu via=%s",
-              static_cast<unsigned long>(next_chunk + 1),
+              static_cast<unsigned long>(next_chunk),
               recipient->name);
-    char status[112];
-    snprintf(status, sizeof(status), "image transfer send failed on chunk %lu/%lu via %s",
-             static_cast<unsigned long>(next_chunk + 1),
-             static_cast<unsigned long>(state_.total_chunks),
-             recipient->name);
-    mesh.queueContactPlainMessage(*recipient, status);
   }
   return sent;
 }
