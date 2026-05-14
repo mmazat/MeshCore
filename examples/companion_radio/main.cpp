@@ -2,6 +2,15 @@
 #include <Mesh.h>
 #include "MyMesh.h"
 
+static inline void setupDebugSerial() {
+#if IMG_TX_SERIAL_LOG_ENABLE
+  Serial.begin(115200);
+  #if defined(ESP32)
+    Serial.setDebugOutput(false);
+  #endif
+#endif
+}
+
 // Believe it or not, this std C function is busted on some platforms!
 static uint32_t _atoi(const char* sp) {
   uint32_t n = 0;
@@ -106,8 +115,7 @@ void halt() {
 }
 
 void setup() {
-  Serial.begin(115200);
-
+  setupDebugSerial();
   board.begin();
 
 #ifdef DISPLAY_CLASS

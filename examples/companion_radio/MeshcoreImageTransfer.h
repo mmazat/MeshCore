@@ -13,7 +13,6 @@ public:
   void begin();
   bool start(const char* file_path, uint32_t job_seed, const char* direct_target_name = nullptr);
   bool abort(MyMesh& mesh);
-  void copyLogsToSDCard();
   void loop(MyMesh& mesh);
   bool handleDirectMessage(MyMesh& mesh, const char* text, const char* sender_name,
                            uint32_t response_timestamp, char* reply_text, size_t reply_text_len);
@@ -60,7 +59,6 @@ private:
   bool loadState();
   bool saveState();
   void clearState();
-  void appendLog(const char* fmt, ...);
   void maybeReportRetryAttempt(MyMesh& mesh) const;
   void reportLocalStatus(MyMesh& mesh, const char* text) const;
   bool sendStart(MyMesh& mesh);

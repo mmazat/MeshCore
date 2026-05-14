@@ -37,8 +37,20 @@ constexpr uint8_t kSlowRetryAttempts = 3;
 constexpr char kTransferDir[] = "/imgtx";
 constexpr char kStatePath[] = "/imgtx/state.bin";
 constexpr char kStateTmpPath[] = "/imgtx/state.bin.tmp";
-constexpr char kLogPath[] = "/imgtx/tx.log";
 constexpr char kProtocolPrefix[] = "@img1|";
+
+void imgTxLogf(const char* fmt, ...) {
+#if IMG_TX_SERIAL_LOG_ENABLE
+  char buffer[256];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buffer, sizeof(buffer), fmt, args);
+  va_end(args);
+  Serial.println(buffer);
+#else
+  (void)fmt;
+#endif
+}
 
 File openReadFile(FILESYSTEM* fs, const char* path) {
 #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
@@ -58,16 +70,6 @@ File openWriteFile(FILESYSTEM* fs, const char* path) {
   return fs->open(path, "w");
 #else
   return fs->open(path, "w", true);
-#endif
-}
-
-File openAppendFile(FILESYSTEM* fs, const char* path) {
-#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
-  return fs->open(path, FILE_O_WRITE | FILE_O_APPEND);
-#elif defined(RP2040_PLATFORM)
-  return fs->open(path, "a");
-#else
-  return fs->open(path, "a", true);
 #endif
 }
 
@@ -325,6 +327,7 @@ void MeshcoreImageTransfer::maybeReportRetryAttempt(MyMesh& mesh) const {
 
 void MeshcoreImageTransfer::begin() {
   state_fs_->mkdir(kTransferDir);
+  imgTxLogf("[IMG_TX] begin");
   if (loadState() && state_.active != 0) {
     // After a restart the gateway may have lost its session state, so always
     // re-do the start handshake.  Clearing start_acked forces sendStart() to
@@ -335,32 +338,41 @@ void MeshcoreImageTransfer::begin() {
     state_.last_attempt_millis = 0;
     state_.last_attempt_timeout_millis = 0;
     RetryPolicy::reset(state_.retry_state);
-    saveState();
-    appendLog("resume job=%s path=%s ack=%lu/%lu (re-handshake)",
+    imgTxLogf("[IMG_TX] resume armed job=%s acked=%lu/%lu target=%s",
               state_.job_id,
-              state_.file_path,
-              state_.last_acked_chunk == kNoChunkAcked ? 0ul : state_.last_acked_chunk + 1,
-              state_.total_chunks);
+              state_.last_acked_chunk == kNoChunkAcked ? 0ul : static_cast<unsigned long>(state_.last_acked_chunk + 1),
+              static_cast<unsigned long>(state_.total_chunks),
+              state_.direct_target_name[0] != 0 ? state_.direct_target_name : "(none)");
+  } else {
+    imgTxLogf("[IMG_TX] no resumable transfer state");
   }
 }
 
 bool MeshcoreImageTransfer::start(const char* file_path, uint32_t job_seed, const char* direct_target_name) {
   if (file_path == nullptr || file_path[0] == 0) {
+    imgTxLogf("[IMG_TX] start rejected: empty path");
     return false;
   }
 
+  imgTxLogf("[IMG_TX] start requested path=%s seed=%08lx target=%s",
+            file_path,
+            static_cast<unsigned long>(job_seed),
+            direct_target_name != nullptr && direct_target_name[0] != 0 ? direct_target_name : "(none)");
+
   if (state_.active != 0) {
-    appendLog("replace-active job=%s path=%s", state_.job_id, state_.file_path);
+    imgTxLogf("[IMG_TX] start replacing active job=%s", state_.job_id);
     clearState();
   }
 
   size_t file_size = 0;
   if (!board_get_sd_file_size(file_path, &file_size) || file_size == 0) {
+    imgTxLogf("[IMG_TX] start failed: invalid file size path=%s", file_path);
     return false;
   }
 
   uint32_t crc32 = 0;
   if (!computeCRC32(file_path, &crc32)) {
+    imgTxLogf("[IMG_TX] start failed: crc32 compute failed path=%s", file_path);
     return false;
   }
 
@@ -387,15 +399,10 @@ bool MeshcoreImageTransfer::start(const char* file_path, uint32_t job_seed, cons
   } else {
     state_.direct_target_name[0] = 0;
   }
-
-  appendLog("start job=%s path=%s size=%lu chunks=%lu crc=%08lx target=%s",
+  imgTxLogf("[IMG_TX] start prepared job=%s chunks=%lu",
             state_.job_id,
-            state_.file_path,
-            static_cast<unsigned long>(state_.file_size),
-            static_cast<unsigned long>(state_.total_chunks),
-            static_cast<unsigned long>(state_.crc32),
-            state_.direct_target_name);
-  return saveState();
+            static_cast<unsigned long>(state_.total_chunks));
+  return true;
 }
 
 void MeshcoreImageTransfer::loop(MyMesh& mesh) {
@@ -404,9 +411,6 @@ void MeshcoreImageTransfer::loop(MyMesh& mesh) {
   }
 
   unsigned long now = millis();
-  // Detailed logging for every loop call when transfer is active
-  bool is_sending_start = (state_.start_acked == 0);
-  
   if (state_.last_attempt_millis != 0) {
     unsigned long ack_wait_millis = state_.last_attempt_timeout_millis == 0
                                         ? kMinAckWaitMillis
@@ -420,35 +424,33 @@ void MeshcoreImageTransfer::loop(MyMesh& mesh) {
     if (elapsed < ack_wait_millis + retry_delay) {
       return;  // Waiting for retry interval before next attempt
     }
+
+    imgTxLogf("[IMG_TX] ack timeout job=%s phase=%s elapsed=%lums wait=%lums retry_delay=%lums",
+              state_.job_id,
+              state_.start_acked == 0 ? "start" : "chunk",
+              elapsed,
+              ack_wait_millis,
+              retry_delay);
+
+    maybeReportRetryAttempt(mesh);
   }
 
-  maybeReportRetryAttempt(mesh);
   bool sent = false;
   if (state_.start_acked == 0) {
     sent = sendStart(mesh);
-    if (!sent) {
-      appendLog("sendStart failed: job=%s target=%s", state_.job_id, state_.direct_target_name);
-    } else {
-      appendLog("loop-sending-start job=%s attempt_timeout=%lums", state_.job_id, state_.last_attempt_timeout_millis);
-    }
   } else {
     sent = sendChunk(mesh);
-    if (!sent) {
-      appendLog("sendChunk failed: job=%s chunk=%lu/%lu target=%s", state_.job_id,
-                state_.last_acked_chunk == kNoChunkAcked ? 0ul : state_.last_acked_chunk + 1,
-                state_.total_chunks,
-                state_.direct_target_name);
-    } else {
-      appendLog("loop-sending-chunk job=%s idx=%lu/%lu", state_.job_id,
-                state_.last_acked_chunk == kNoChunkAcked ? 0ul : state_.last_acked_chunk + 1,
-                state_.total_chunks);
-    }
   }
   if (sent) {
     state_.last_attempt_millis = now;
     RetryPolicy::noteAttempt(state_.retry_state);
-    saveState();
     // Don't block here - let the next loop iteration check timing naturally
+    // NOTE: last_attempt_millis and retry counters are timing state only; no need
+    // to persist to flash on every send. last_acked_chunk is saved in handleProtocolMessage.
+  } else {
+    imgTxLogf("[IMG_TX] send attempt failed phase=%s job=%s",
+              state_.start_acked == 0 ? "start" : "chunk",
+              state_.job_id);
   }
 }
 
@@ -462,6 +464,9 @@ bool MeshcoreImageTransfer::handleDirectMessage(MyMesh& mesh, const char* text, 
   reply_text[0] = 0;
 
   const char* command = text == nullptr ? nullptr : skipWhitespace(text);
+  imgTxLogf("[IMG_TX] direct msg sender=%s text=%s",
+            sender_name != nullptr ? sender_name : "(null)",
+            command != nullptr ? command : "(null)");
 
   // Generic handler for any command starting with '!'
   if (command && command[0] == '!') {
@@ -482,6 +487,11 @@ bool MeshcoreImageTransfer::handleDirectMessage(MyMesh& mesh, const char* text, 
       if (capture_ok) {
         transfer_started = start(capture_path, response_timestamp, sender_name);
       }
+      imgTxLogf("[IMG_TX] capture result ok=%u transfer_started=%u path=%s bytes=%lu",
+                capture_ok ? 1u : 0u,
+                transfer_started ? 1u : 0u,
+                capture_path,
+                static_cast<unsigned long>(bytes_written));
 
       if (!capture_ok) {
         snprintf(reply_text, reply_text_len,
@@ -505,6 +515,9 @@ bool MeshcoreImageTransfer::handleDirectMessage(MyMesh& mesh, const char* text, 
     const char* sendfile_path = parseSendFileCommand(command);
     if (sendfile_path != nullptr) {
       bool transfer_started = start(sendfile_path, response_timestamp, sender_name);
+      imgTxLogf("[IMG_TX] sendfile cmd path=%s transfer_started=%u",
+                sendfile_path,
+                transfer_started ? 1u : 0u);
       snprintf(reply_text, reply_text_len,
                "sendfile path=%s transfer=%s",
                sendfile_path,
@@ -513,8 +526,8 @@ bool MeshcoreImageTransfer::handleDirectMessage(MyMesh& mesh, const char* text, 
     }
 
     if (isAbortCommand(command)) {
-      appendLog("!abort command received from %s", sender_name ? sender_name : "(unknown)");
       bool was_active = abort(mesh);
+      imgTxLogf("[IMG_TX] abort cmd result active_before=%u", was_active ? 1u : 0u);
       snprintf(reply_text, reply_text_len,
                "abort transfer=%s",
                was_active ? "aborted" : "none");
@@ -533,6 +546,10 @@ bool MeshcoreImageTransfer::handleProtocolMessage(const char* text, const char* 
     return false;
   }
 
+  imgTxLogf("[IMG_TX] proto rx sender=%s text=%s",
+            sender_name != nullptr ? sender_name : "(null)",
+            text);
+
   char buffer[192];
   strncpy(buffer, text, sizeof(buffer) - 1);
   buffer[sizeof(buffer) - 1] = 0;
@@ -543,6 +560,10 @@ bool MeshcoreImageTransfer::handleProtocolMessage(const char* text, const char* 
   char* job_id = strtok_r(nullptr, "|", &save_ptr);
 
   if (prefix == nullptr || verb == nullptr || job_id == nullptr || strcmp(job_id, state_.job_id) != 0) {
+    imgTxLogf("[IMG_TX] proto ignored verb=%s job=%s active_job=%s",
+              verb != nullptr ? verb : "(null)",
+              job_id != nullptr ? job_id : "(null)",
+              state_.job_id);
     return startsWith(text, kProtocolPrefix);
   }
 
@@ -554,20 +575,25 @@ bool MeshcoreImageTransfer::handleProtocolMessage(const char* text, const char* 
     state_.last_attempt_millis = 0;
     state_.last_attempt_timeout_millis = 0;
     RetryPolicy::reset(state_.retry_state);
-    appendLog("ack-start job=%s target=%s", state_.job_id,
-              state_.direct_target_name[0] != 0 ? state_.direct_target_name : "(none)");
-    saveState();
+    imgTxLogf("[IMG_TX] start acked job=%s sender=%s",
+              state_.job_id,
+              sender_name != nullptr ? sender_name : "(null)");
     return true;
   }
 
   if (strcmp(verb, "ac") == 0) {
     char* chunk_idx_text = strtok_r(nullptr, "|", &save_ptr);
     if (chunk_idx_text == nullptr) {
+      imgTxLogf("[IMG_TX] chunk ack missing index");
       return true;
     }
 
     uint32_t chunk_idx = static_cast<uint32_t>(strtoul(chunk_idx_text, nullptr, 10));
     uint32_t expected = state_.last_acked_chunk == kNoChunkAcked ? 0 : state_.last_acked_chunk + 1;
+    imgTxLogf("[IMG_TX] chunk ack rx job=%s idx=%lu expected=%lu",
+              state_.job_id,
+              static_cast<unsigned long>(chunk_idx),
+              static_cast<unsigned long>(expected));
     if (chunk_idx == expected) {
       if (sender_name != nullptr && sender_name[0] != 0) {
         copyName(state_.direct_target_name, sizeof(state_.direct_target_name), sender_name);
@@ -576,36 +602,38 @@ bool MeshcoreImageTransfer::handleProtocolMessage(const char* text, const char* 
       state_.last_attempt_millis = 0;
       state_.last_attempt_timeout_millis = 0;
       RetryPolicy::reset(state_.retry_state);
-      appendLog("ack-chunk job=%s idx=%lu/%lu", state_.job_id,
-                static_cast<unsigned long>(chunk_idx),
-                static_cast<unsigned long>(state_.total_chunks));
       if (state_.last_acked_chunk + 1 >= state_.total_chunks) {
-        appendLog("complete job=%s path=%s, clearing and resetting state", state_.job_id, state_.file_path);
         // Free RAM buffer before clearing state
+        imgTxLogf("[IMG_TX] transfer complete job=%s chunks=%lu",
+                  state_.job_id,
+                  static_cast<unsigned long>(state_.total_chunks));
         if (image_buffer_) {
           free(image_buffer_);
           image_buffer_ = nullptr;
           image_buffer_size_ = 0;
         }
         clearState();
-        // Copy logs to SD card after successful transfer
-        copyLogsToSDCard();
-        // Extra: reload and log state to confirm reset
-        bool loaded = loadState();
-        appendLog("post-complete state.active=%u job_id=%s", state_.active, state_.job_id);
       } else {
-        saveState();
+        bool saved = saveState();
+        imgTxLogf("[IMG_TX] checkpoint saved job=%s acked=%lu/%lu save=%u",
+                  state_.job_id,
+                  static_cast<unsigned long>(state_.last_acked_chunk + 1),
+                  static_cast<unsigned long>(state_.total_chunks),
+                  saved ? 1u : 0u);
       }
+    } else {
+      imgTxLogf("[IMG_TX] chunk ack out-of-order ignored idx=%lu expected=%lu",
+                static_cast<unsigned long>(chunk_idx),
+                static_cast<unsigned long>(expected));
     }
     return true;
   }
 
   if (strcmp(verb, "x") == 0) {
-    appendLog("abort job=%s reason=%s, clearing and resetting state", state_.job_id, save_ptr == nullptr ? "unspecified" : save_ptr);
+    imgTxLogf("[IMG_TX] remote abort rx job=%s reason=%s",
+              state_.job_id,
+              save_ptr == nullptr || save_ptr[0] == 0 ? "unspecified" : save_ptr);
     clearState();
-    // Extra: reload and log state to confirm reset
-    bool loaded = loadState();
-    appendLog("post-abort state.active=%u job_id=%s", state_.active, state_.job_id);
     return true;
   }
 
@@ -679,24 +707,36 @@ bool MeshcoreImageTransfer::loadState() {
   resetState();
   File state_file = openReadFile(state_fs_, kStatePath);
   if (!state_file) {
+    imgTxLogf("[IMG_TX] loadState missing primary path=%s, trying tmp", kStatePath);
     state_file = openReadFile(state_fs_, kStateTmpPath);
   }
   if (!state_file) {
+    imgTxLogf("[IMG_TX] loadState no persisted state");
     return false;
   }
 
   size_t bytes_read = state_file.read(reinterpret_cast<uint8_t*>(&state_), sizeof(state_));
   state_file.close();
   if (bytes_read != sizeof(state_) || state_.magic != kStateMagic || state_.version != kStateVersion) {
+    imgTxLogf("[IMG_TX] loadState invalid bytes=%lu magic=%08lx version=%u",
+              static_cast<unsigned long>(bytes_read),
+              static_cast<unsigned long>(state_.magic),
+              static_cast<unsigned>(state_.version));
     resetState();
     return false;
   }
+  imgTxLogf("[IMG_TX] loadState ok active=%u job=%s acked=%lu/%lu",
+            static_cast<unsigned>(state_.active),
+            state_.job_id,
+            state_.last_acked_chunk == kNoChunkAcked ? 0ul : static_cast<unsigned long>(state_.last_acked_chunk + 1),
+            static_cast<unsigned long>(state_.total_chunks));
   return true;
 }
 
 bool MeshcoreImageTransfer::saveState() {
   File state_file = openWriteFile(state_fs_, kStateTmpPath);
   if (!state_file) {
+    imgTxLogf("[IMG_TX] saveState open tmp failed path=%s", kStateTmpPath);
     return false;
   }
 
@@ -705,39 +745,35 @@ bool MeshcoreImageTransfer::saveState() {
   state_file.close();
   if (bytes_written != sizeof(state_)) {
     state_fs_->remove(kStateTmpPath);
+    imgTxLogf("[IMG_TX] saveState write failed bytes=%lu expected=%lu",
+              static_cast<unsigned long>(bytes_written),
+              static_cast<unsigned long>(sizeof(state_)));
     return false;
   }
 
   state_fs_->remove(kStatePath);
   if (!state_fs_->rename(kStateTmpPath, kStatePath)) {
     state_fs_->remove(kStateTmpPath);
+    imgTxLogf("[IMG_TX] saveState rename failed %s -> %s", kStateTmpPath, kStatePath);
     return false;
   }
+  imgTxLogf("[IMG_TX] saveState ok active=%u job=%s acked=%lu/%lu",
+            static_cast<unsigned>(state_.active),
+            state_.job_id,
+            state_.last_acked_chunk == kNoChunkAcked ? 0ul : static_cast<unsigned long>(state_.last_acked_chunk + 1),
+            static_cast<unsigned long>(state_.total_chunks));
   return true;
 }
 
 void MeshcoreImageTransfer::clearState() {
+  imgTxLogf("[IMG_TX] clearState active=%u job=%s",
+            static_cast<unsigned>(state_.active),
+            state_.job_id);
   resetState();
   state_fs_->remove(kStatePath);
   state_fs_->remove(kStateTmpPath);
 }
 
-void MeshcoreImageTransfer::appendLog(const char* fmt, ...) {
-  char line[192];
-  va_list args;
-  va_start(args, fmt);
-  vsnprintf(line, sizeof(line), fmt, args);
-  va_end(args);
-
-  File log_file = openAppendFile(state_fs_, kLogPath);
-  if (!log_file) {
-    return;
-  }
-
-  log_file.printf("%lu %s\n", millis(), line);
-  log_file.flush();
-  log_file.close();
-}
 
 bool MeshcoreImageTransfer::sendStart(MyMesh& mesh) {
   char message[160];
@@ -752,7 +788,7 @@ bool MeshcoreImageTransfer::sendStart(MyMesh& mesh) {
   const char* target_name = state_.direct_target_name[0] != 0 ? state_.direct_target_name : nullptr;
   ContactInfo* recipient = findTargetContact(mesh, target_name);
   if (recipient == nullptr) {
-    appendLog("missing-contact job=%s want=%s", state_.job_id,
+    imgTxLogf("[IMG_TX] sendStart failed: target not found target=%s",
               target_name != nullptr ? target_name : "(none)");
     reportLocalStatus(mesh, "image transfer send failed: missing target contact");
     return false;
@@ -769,11 +805,9 @@ bool MeshcoreImageTransfer::sendStart(MyMesh& mesh) {
       est_timeout) != MSG_SEND_FAILED;
   if (sent) {
     state_.last_attempt_timeout_millis = kMinAckWaitMillis;
-  }
-  if (sent) {
-    appendLog("send-start-direct job=%s via=%s", state_.job_id, recipient->name);
+    imgTxLogf("[IMG_TX] sendStart job=%s via=%s", state_.job_id, recipient->name);
   } else {
-    appendLog("send-start-direct-failed job=%s via=%s", state_.job_id, recipient->name);
+    imgTxLogf("[IMG_TX] sendStart sendMessage failed job=%s via=%s", state_.job_id, recipient->name);
     char status[96];
     snprintf(status, sizeof(status), "image transfer send failed on start via %s", recipient->name);
     mesh.queueContactPlainMessage(*recipient, status);
@@ -783,58 +817,52 @@ bool MeshcoreImageTransfer::sendStart(MyMesh& mesh) {
 
 bool MeshcoreImageTransfer::sendChunk(MyMesh& mesh) {
   uint32_t next_chunk = state_.last_acked_chunk == kNoChunkAcked ? 0 : state_.last_acked_chunk + 1;
-  appendLog("sendChunk-entry job=%s next=%lu total=%lu target=%s", state_.job_id,
-            static_cast<unsigned long>(next_chunk),
-            static_cast<unsigned long>(state_.total_chunks),
-            state_.direct_target_name[0] != 0 ? state_.direct_target_name : "(none)");
-  
   if (next_chunk >= state_.total_chunks) {
+    imgTxLogf("[IMG_TX] sendChunk reached end next=%lu total=%lu",
+              static_cast<unsigned long>(next_chunk),
+              static_cast<unsigned long>(state_.total_chunks));
     clearState();
     return false;
   }
-
   if (state_.chunk_size > kRawChunkBytes) {
-    appendLog("chunk-size-invalid job=%s size=%lu max=%u", state_.job_id,
+    imgTxLogf("[IMG_TX] sendChunk invalid chunk_size=%lu max=%lu",
               static_cast<unsigned long>(state_.chunk_size),
-              static_cast<unsigned>(kRawChunkBytes));
+              static_cast<unsigned long>(kRawChunkBytes));
     return false;
   }
-
   uint8_t raw[kRawChunkBytes];
   size_t bytes_read = 0;
   if (!readChunk(next_chunk, raw, &bytes_read) || bytes_read == 0) {
-    appendLog("chunk-read-failed job=%s idx=%lu", state_.job_id, static_cast<unsigned long>(next_chunk));
+    imgTxLogf("[IMG_TX] sendChunk read failed chunk=%lu", static_cast<unsigned long>(next_chunk));
     return false;
   }
-
-  // Encode chunk as text: @img1|d|<job_id>|<chunk_idx>|<base64_data>
-  char b64_buf[128]; // ceil(93*4/3)+1 = 124+1=125, padded to 128
+  char b64_buf[128];
   size_t b64_len = encodeBase64(raw, bytes_read, b64_buf, sizeof(b64_buf));
   if (b64_len == 0) {
-    appendLog("chunk-encode-failed job=%s idx=%lu", state_.job_id, static_cast<unsigned long>(next_chunk));
+    imgTxLogf("[IMG_TX] sendChunk b64 encode failed chunk=%lu bytes=%lu",
+              static_cast<unsigned long>(next_chunk),
+              static_cast<unsigned long>(bytes_read));
     return false;
   }
-
   char message[160];
   int msg_len = snprintf(message, sizeof(message), "@img1|d|%s|%lu|%s",
                          state_.job_id,
                          static_cast<unsigned long>(next_chunk),
                          b64_buf);
   if (msg_len < 0 || static_cast<size_t>(msg_len) >= sizeof(message)) {
-    appendLog("chunk-msg-too-long job=%s idx=%lu len=%d", state_.job_id,
-              static_cast<unsigned long>(next_chunk), msg_len);
+    imgTxLogf("[IMG_TX] sendChunk message format overflow chunk=%lu len=%d",
+              static_cast<unsigned long>(next_chunk),
+              msg_len);
     return false;
   }
-
   const char* target_name = state_.direct_target_name[0] != 0 ? state_.direct_target_name : nullptr;
   ContactInfo* recipient = findTargetContact(mesh, target_name);
   if (recipient == nullptr) {
-    appendLog("missing-contact job=%s want=%s", state_.job_id,
+    imgTxLogf("[IMG_TX] sendChunk failed: target not found target=%s",
               target_name != nullptr ? target_name : "(none)");
     reportLocalStatus(mesh, "image transfer send failed: missing target contact");
     return false;
   }
-
   uint32_t expected_ack = 0;
   uint32_t est_timeout = 0;
   bool sent = mesh.sendMessage(
@@ -846,15 +874,15 @@ bool MeshcoreImageTransfer::sendChunk(MyMesh& mesh) {
       est_timeout) != MSG_SEND_FAILED;
   if (sent) {
     state_.last_attempt_timeout_millis = kMinAckWaitMillis;
-  }
-  if (sent) {
-    appendLog("send-chunk job=%s idx=%lu bytes=%u via=%s", state_.job_id,
-              static_cast<unsigned long>(next_chunk),
-              static_cast<unsigned>(bytes_read),
+    imgTxLogf("[IMG_TX] sendChunk ok job=%s chunk=%lu/%lu bytes=%lu via=%s",
+              state_.job_id,
+              static_cast<unsigned long>(next_chunk + 1),
+              static_cast<unsigned long>(state_.total_chunks),
+              static_cast<unsigned long>(bytes_read),
               recipient->name);
   } else {
-    appendLog("send-chunk-failed job=%s idx=%lu via=%s", state_.job_id,
-              static_cast<unsigned long>(next_chunk),
+    imgTxLogf("[IMG_TX] sendChunk sendMessage failed chunk=%lu via=%s",
+              static_cast<unsigned long>(next_chunk + 1),
               recipient->name);
     char status[112];
     snprintf(status, sizeof(status), "image transfer send failed on chunk %lu/%lu via %s",
@@ -868,44 +896,49 @@ bool MeshcoreImageTransfer::sendChunk(MyMesh& mesh) {
 
 bool MeshcoreImageTransfer::readChunk(uint32_t chunk_idx, uint8_t* buffer, size_t* bytes_read) {
   if (bytes_read == nullptr) {
+    imgTxLogf("[IMG_TX] readChunk failed: bytes_read pointer null");
     return false;
   }
   *bytes_read = 0;
-
   if (!kLocalImageCaptureSupported) {
+    imgTxLogf("[IMG_TX] readChunk unsupported on this platform");
     (void)chunk_idx;
     (void)buffer;
     return false;
   }
-
-  // RAM-caching logic
   if (image_buffer_ == nullptr) {
-    // Allocate and load image into RAM
     if (state_.file_size == 0) {
-      appendLog("ram-cache: file_size is 0");
+      imgTxLogf("[IMG_TX] readChunk failed: file_size is zero");
       return false;
     }
     uint8_t* new_buf = (uint8_t*)malloc(state_.file_size);
     if (!new_buf) {
-      appendLog("ram-cache: malloc failed for %lu bytes", static_cast<unsigned long>(state_.file_size));
+      imgTxLogf("[IMG_TX] readChunk malloc failed size=%lu", static_cast<unsigned long>(state_.file_size));
       return false;
     }
     size_t total_read = 0;
     bool ok = board_read_sd_file_chunk(state_.file_path, 0, new_buf, state_.file_size, &total_read);
     if (!ok || total_read != state_.file_size) {
-      appendLog("ram-cache: failed to read file to RAM (%lu/%lu)", static_cast<unsigned long>(total_read), static_cast<unsigned long>(state_.file_size));
+      imgTxLogf("[IMG_TX] readChunk preload failed ok=%u read=%lu expected=%lu path=%s",
+                ok ? 1u : 0u,
+                static_cast<unsigned long>(total_read),
+                static_cast<unsigned long>(state_.file_size),
+                state_.file_path);
       free(new_buf);
       return false;
     }
     image_buffer_ = new_buf;
     image_buffer_size_ = state_.file_size;
-    appendLog("ram-cache: loaded %lu bytes into RAM", static_cast<unsigned long>(state_.file_size));
+    imgTxLogf("[IMG_TX] readChunk preloaded image path=%s size=%lu",
+              state_.file_path,
+              static_cast<unsigned long>(image_buffer_size_));
   }
-
-  // Serve chunk from RAM
   size_t offset = static_cast<size_t>(chunk_idx) * state_.chunk_size;
   if (offset >= image_buffer_size_) {
-    appendLog("ram-cache: chunk offset out of range (%lu/%lu)", static_cast<unsigned long>(offset), static_cast<unsigned long>(image_buffer_size_));
+    imgTxLogf("[IMG_TX] readChunk offset out of range chunk=%lu offset=%lu size=%lu",
+              static_cast<unsigned long>(chunk_idx),
+              static_cast<unsigned long>(offset),
+              static_cast<unsigned long>(image_buffer_size_));
     return false;
   }
   size_t remain = image_buffer_size_ - offset;
@@ -917,121 +950,45 @@ bool MeshcoreImageTransfer::readChunk(uint32_t chunk_idx, uint8_t* buffer, size_
 
 bool MeshcoreImageTransfer::abort(MyMesh& mesh) {
   if (state_.active == 0) {
+    imgTxLogf("[IMG_TX] abort ignored: no active transfer");
     return false;
   }
-
+  imgTxLogf("[IMG_TX] abort requested job=%s target=%s",
+            state_.job_id,
+            state_.direct_target_name[0] != 0 ? state_.direct_target_name : "(none)");
   char message[64];
   snprintf(message, sizeof(message), "@img1|x|%s|user-abort", state_.job_id);
-
   const char* target_name = state_.direct_target_name[0] != 0 ? state_.direct_target_name : nullptr;
   ContactInfo* recipient = findTargetContact(mesh, target_name);
   if (recipient != nullptr) {
     uint32_t expected_ack = 0;
     uint32_t est_timeout = 0;
     mesh.sendMessage(*recipient, mesh.getRTCClock()->getCurrentTime(), 0, message, expected_ack, est_timeout);
+  } else {
+    imgTxLogf("[IMG_TX] abort notify skipped: recipient not found");
   }
-  appendLog("user-abort job=%s", state_.job_id);
-  // Free RAM buffer before clearing state
   if (image_buffer_) {
     free(image_buffer_);
     image_buffer_ = nullptr;
     image_buffer_size_ = 0;
   }
   clearState();
-
-  // Copy logs to SD card after abort
-  copyLogsToSDCard();
   return true;
-}
-// Copy /imgtx logs to a timestamped folder on the SD card
-void MeshcoreImageTransfer::copyLogsToSDCard() {
-#if defined(ESP32_S3_N16R8_SX1262)
-  const char* src_dir = "/imgtx";
-
-  // Force filesystem metadata and buffered log data out before taking the copy snapshot.
-  File log_file = openAppendFile(state_fs_, kLogPath);
-  if (log_file) {
-    log_file.flush();
-    log_file.close();
-  }
-
-  // Build timestamped destination directory path
-  time_t now_t = time(nullptr);
-  struct tm tm_now;
-  localtime_r(&now_t, &tm_now);
-  char ts[20];
-  strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", &tm_now);
-  char dest_dir[64];
-  snprintf(dest_dir, sizeof(dest_dir), "/imgtx_aborted/%s", ts);
-
-  appendLog("copy-logs-start src=%s dest=%s", src_dir, dest_dir);
-
-  // Create parent and destination directories on SD card
-  if (!SD_MMC.exists("/imgtx_aborted")) {
-    SD_MMC.mkdir("/imgtx_aborted");
-  }
-  if (!SD_MMC.mkdir(dest_dir)) {
-    appendLog("copy-logs-mkdir-failed dest=%s", dest_dir);
-    return;
-  }
-
-  File src = state_fs_->open(src_dir);
-  if (!src || !src.isDirectory()) {
-    appendLog("copy-logs-open-src-failed src=%s", src_dir);
-    return;
-  }
-
-  int copied = 0;
-  int failed = 0;
-  uint8_t copy_buf[256];
-  File entry = src.openNextFile();
-  while (entry) {
-    if (!entry.isDirectory()) {
-      // entry.name() returns full path on ESP32 LittleFS e.g. "/imgtx/tx.log"
-      const char* full_name = entry.name();
-      const char* slash = strrchr(full_name, '/');
-      const char* fname = (slash != nullptr) ? slash + 1 : full_name;
-      char dest_path[96];
-      snprintf(dest_path, sizeof(dest_path), "%s/%s", dest_dir, fname);
-
-      File dest = SD_MMC.open(dest_path, FILE_WRITE);
-      if (dest) {
-        // entry.available() is unreliable on ESP32 LittleFS — use size() instead.
-        entry.seek(0);
-        size_t remaining = entry.size();
-        while (remaining > 0) {
-          size_t to_read = remaining < sizeof(copy_buf) ? remaining : sizeof(copy_buf);
-          size_t n = entry.read(copy_buf, to_read);
-          if (n == 0) break;
-          dest.write(copy_buf, n);
-          remaining -= n;
-        }
-        dest.flush();
-        dest.close();
-        appendLog("copy-logs-file-ok src=%s dest=%s size=%u", full_name, dest_path, (unsigned)entry.size());
-        copied++;
-      } else {
-        appendLog("copy-logs-file-failed dest=%s", dest_path);
-        failed++;
-      }
-    }
-    entry.close();
-    entry = src.openNextFile();
-  }
-  src.close();
-
-  appendLog("copy-logs-done copied=%d failed=%d dest=%s", copied, failed, dest_dir);
-#endif
 }
 
 bool MeshcoreImageTransfer::computeCRC32(const char* file_path, uint32_t* crc32_out) const {
   if (!kLocalImageCaptureSupported) {
+    imgTxLogf("[IMG_TX] computeCRC32 unsupported on this platform");
     (void)file_path;
     (void)crc32_out;
     return false;
   }
-
-  return board_compute_sd_file_crc32(file_path, crc32_out);
+  bool ok = board_compute_sd_file_crc32(file_path, crc32_out);
+  imgTxLogf("[IMG_TX] computeCRC32 path=%s ok=%u crc=%08lx",
+            file_path,
+            ok ? 1u : 0u,
+            (ok && crc32_out != nullptr) ? static_cast<unsigned long>(*crc32_out) : 0ul);
+  return ok;
 }
 
 void MeshcoreImageTransfer::resetState() {
@@ -1047,4 +1004,5 @@ void MeshcoreImageTransfer::resetState() {
   state_.last_acked_chunk = kNoChunkAcked;
   state_.chunk_size = static_cast<uint32_t>(kRawChunkBytes);
   RetryPolicy::reset(state_.retry_state);
+  imgTxLogf("[IMG_TX] state reset");
 }
