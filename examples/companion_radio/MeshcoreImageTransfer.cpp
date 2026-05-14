@@ -734,6 +734,7 @@ bool MeshcoreImageTransfer::loadState() {
 }
 
 bool MeshcoreImageTransfer::saveState() {
+  vTaskDelay(1);
   File state_file = openWriteFile(state_fs_, kStateTmpPath);
   if (!state_file) {
     imgTxLogf("[IMG_TX] saveState open tmp failed path=%s", kStateTmpPath);
