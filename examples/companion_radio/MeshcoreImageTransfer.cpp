@@ -13,7 +13,6 @@
 namespace {
 
 constexpr size_t kRawChunkBytes = 93;
-constexpr char kCurrentImagePath[] = "/imgtx/current.jpg";
 
 uint32_t calcCrc32(const uint8_t* data, size_t len) {
   uint32_t crc = 0xFFFFFFFFu;
@@ -120,6 +119,42 @@ ContactInfo* findTargetContact(MyMesh& mesh, const char* target_name) {
   return mesh.searchContactsByPrefix(best_match.name);
 }
 
+int findNextJobIdOnSd() {
+  int max_job_id = -1;
+#if defined(ESP32_S3_N16R8_SX1262)
+  File dir = SD_MMC.open("/imgtx");
+  if (dir) {
+    File entry = dir.openNextFile();
+    while (entry) {
+      const char* fname = entry.name();
+      const char* ext = strrchr(fname, '.');
+      if (ext && strcmp(ext, ".jpg") == 0) {
+        const char* base = strrchr(fname, '/');
+        const char* num = base ? base + 1 : fname;
+        char numbuf[16] = {0};
+        strncpy(numbuf, num, sizeof(numbuf) - 1);
+        char* dot = strrchr(numbuf, '.');
+        if (dot) *dot = '\0';
+        bool all_digits = true;
+        for (size_t i = 0; numbuf[i]; i++) {
+          if (!isdigit((unsigned char)numbuf[i])) {
+            all_digits = false;
+            break;
+          }
+        }
+        if (all_digits && numbuf[0] != '\0') {
+          int jid = atoi(numbuf);
+          if (jid > max_job_id) max_job_id = jid;
+        }
+      }
+      entry = dir.openNextFile();
+    }
+    dir.close();
+  }
+#endif
+  return max_job_id + 1;
+}
+
 }  // namespace
 
 void MeshcoreImageTransfer::begin() {
@@ -127,22 +162,13 @@ void MeshcoreImageTransfer::begin() {
 }
 
 bool MeshcoreImageTransfer::start(const char* file_path, uint32_t job_seed, const char* direct_target_name) {
+  (void)file_path;
   (void)job_seed;
   (void)direct_target_name;
-
-  if (file_path == nullptr || file_path[0] == 0) {
-    return false;
-  }
-
-  // Optional helper path for manual sendfile workflows: copy to canonical current.jpg
-  bool copied = copyFileOnSd(file_path, kCurrentImagePath);
-  if (!copied) {
-    imgTxLogf("[IMG_TX] start copy failed src=%s dst=%s", file_path, kCurrentImagePath);
-    return false;
-  }
-
-  freeImageBuffer();
-  return loadCurrentJpgToBuffer();
+  // Start is intentionally inert. A new capture is created only when !capture
+  // is received with job_id=-1.
+  imgTxLogf("[IMG_TX] start: no-op (capture deferred to !capture)");
+  return true;
 }
 
 void MeshcoreImageTransfer::loop(MyMesh& mesh) {
@@ -172,6 +198,7 @@ void MeshcoreImageTransfer::freeImageBuffer() {
     image_buffer_size_ = 0;
     total_chunks_ = 0;
   }
+  image_job_id_ = -1;
 }
 
 bool MeshcoreImageTransfer::copyFileOnSd(const char* src_path, const char* dst_path) {
@@ -213,13 +240,17 @@ bool MeshcoreImageTransfer::copyFileOnSd(const char* src_path, const char* dst_p
 #endif
 }
 
-bool MeshcoreImageTransfer::captureCurrentJpgIfMissing() {
-  size_t file_size = 0;
-  if (board_get_sd_file_size(kCurrentImagePath, &file_size) && file_size > 0) {
-    return true;
+bool MeshcoreImageTransfer::captureImageToJobFile(const char* job_img_path) {
+  if (job_img_path == nullptr || job_img_path[0] == 0) {
+    return false;
   }
 
-  // If no current.jpg exists, capture and normalize to /imgtx/current.jpg
+#if !defined(ESP32_S3_N16R8_SX1262)
+  (void)job_img_path;
+  return false;
+#else
+  SD_MMC.mkdir("/imgtx");
+
   char captured_path[64] = {0};
   size_t bytes_written = 0;
   uint16_t img_width = 0;
@@ -231,20 +262,25 @@ bool MeshcoreImageTransfer::captureCurrentJpgIfMissing() {
     return false;
   }
 
-  if (strcmp(captured_path, kCurrentImagePath) != 0) {
-    if (!copyFileOnSd(captured_path, kCurrentImagePath)) {
-      imgTxLogf("[IMG_TX] capture copy failed src=%s", captured_path);
+  if (strcmp(captured_path, job_img_path) != 0) {
+    if (!copyFileOnSd(captured_path, job_img_path)) {
+      imgTxLogf("[IMG_TX] capture copy failed src=%s dst=%s", captured_path, job_img_path);
       return false;
     }
   }
 
-  imgTxLogf("[IMG_TX] capture ready path=%s bytes=%lu", kCurrentImagePath, (unsigned long)bytes_written);
+  imgTxLogf("[IMG_TX] capture saved path=%s bytes=%lu", job_img_path, (unsigned long)bytes_written);
   return true;
+#endif
 }
 
-bool MeshcoreImageTransfer::loadCurrentJpgToBuffer() {
+bool MeshcoreImageTransfer::loadJobJpgToBuffer(const char* job_img_path) {
+  if (job_img_path == nullptr || job_img_path[0] == 0) {
+    return false;
+  }
+
   size_t file_size = 0;
-  if (!board_get_sd_file_size(kCurrentImagePath, &file_size) || file_size == 0) {
+  if (!board_get_sd_file_size(job_img_path, &file_size) || file_size == 0) {
     return false;
   }
 
@@ -254,7 +290,7 @@ bool MeshcoreImageTransfer::loadCurrentJpgToBuffer() {
   }
 
   size_t total_read = 0;
-  bool ok = board_read_sd_file_chunk(kCurrentImagePath, 0, new_buf, file_size, &total_read);
+  bool ok = board_read_sd_file_chunk(job_img_path, 0, new_buf, file_size, &total_read);
   if (!ok || total_read != file_size) {
     free(new_buf);
     return false;
@@ -264,22 +300,11 @@ bool MeshcoreImageTransfer::loadCurrentJpgToBuffer() {
   image_buffer_ = new_buf;
   image_buffer_size_ = file_size;
   total_chunks_ = (uint32_t)((file_size + kRawChunkBytes - 1) / kRawChunkBytes);
-  imgTxLogf("[IMG_TX] loaded current.jpg bytes=%lu chunks=%lu",
+  imgTxLogf("[IMG_TX] loaded %s bytes=%lu chunks=%lu",
+            job_img_path,
             (unsigned long)image_buffer_size_,
             (unsigned long)total_chunks_);
   return true;
-}
-
-bool MeshcoreImageTransfer::ensureImageReady() {
-  if (image_buffer_ != nullptr && image_buffer_size_ > 0 && total_chunks_ > 0) {
-    return true;
-  }
-
-  if (!captureCurrentJpgIfMissing()) {
-    return false;
-  }
-
-  return loadCurrentJpgToBuffer();
 }
 
 bool MeshcoreImageTransfer::sendChunkByIndex(MyMesh& mesh, int chunk_id, const char* sender_name) {
@@ -287,7 +312,8 @@ bool MeshcoreImageTransfer::sendChunkByIndex(MyMesh& mesh, int chunk_id, const c
     return false;
   }
 
-  if (!ensureImageReady()) {
+  // Buffer/job must already be prepared by command routing.
+  if (image_buffer_ == nullptr || image_buffer_size_ == 0 || total_chunks_ == 0 || image_job_id_ < 0) {
     return false;
   }
 
@@ -309,9 +335,10 @@ bool MeshcoreImageTransfer::sendChunkByIndex(MyMesh& mesh, int chunk_id, const c
 
   uint32_t chunk_crc32 = calcCrc32(image_buffer_ + offset, bytes_read);
 
-  char message[160];
-  // Packet format: chunk_id|total_chunks|crc32_hex|Base64_data
-  int msg_len = snprintf(message, sizeof(message), "%d|%lu|%08lx|%s",
+  char message[512];
+  // Packet format: job_id|chunk_id|total_chunks|crc32_hex|Base64_data
+  int msg_len = snprintf(message, sizeof(message), "%d|%d|%lu|%08lx|%s",
+                         (image_job_id_ >= 0 ? image_job_id_ : 0),
                          chunk_id,
                          (unsigned long)total_chunks_,
                          (unsigned long)chunk_crc32,
@@ -335,16 +362,9 @@ bool MeshcoreImageTransfer::sendChunkByIndex(MyMesh& mesh, int chunk_id, const c
                                expected_ack,
                                est_timeout) != MSG_SEND_FAILED;
   if (sent) {
-    imgTxLogf("[IMG_TX] sent chunk=%d/%lu", chunk_id, (unsigned long)total_chunks_);
+    imgTxLogf("[IMG_TX] sent chunk job=%d chunk=%d/%lu", (image_job_id_ >= 0 ? image_job_id_ : 0), chunk_id, (unsigned long)total_chunks_);
   }
   return sent;
-}
-
-void MeshcoreImageTransfer::handleCaptureChunkCommand(MyMesh& mesh, int chunk_id, const char* sender_name) {
-  imgTxLogf("[IMG_TX] request chunk=%d from=%s",
-            chunk_id,
-            sender_name != nullptr && sender_name[0] != 0 ? sender_name : "(unknown)");
-  (void)sendChunkByIndex(mesh, chunk_id, sender_name);
 }
 
 bool MeshcoreImageTransfer::handleDirectMessage(MyMesh& mesh, const char* text, const char* sender_name,
@@ -363,28 +383,89 @@ bool MeshcoreImageTransfer::handleDirectMessage(MyMesh& mesh, const char* text, 
   }
 
   if (strncmp(command, "!capture|", 9) == 0) {
-    const char* idx_text = command + 9;
-    while (*idx_text != 0 && isspace((unsigned char)*idx_text)) {
-      idx_text++;
-    }
-    if (*idx_text == 0) {
-      snprintf(reply_text, reply_text_len, "capture request missing chunk id");
+    // Format: !capture|<job_id>|<chunk_id>
+    const char* args = command + 9;
+    while (*args != 0 && isspace((unsigned char)*args)) args++;
+    const char* sep = strchr(args, '|');
+    if (sep == nullptr) {
+      snprintf(reply_text, reply_text_len, "bad request");
       return true;
     }
+    char jidbuf[16] = {0};
+    size_t jidlen = sep - args;
+    if (jidlen == 0 || jidlen >= sizeof(jidbuf)) {
+      snprintf(reply_text, reply_text_len, "bad request");
+      return true;
+    }
+    strncpy(jidbuf, args, jidlen);
+    int req_job_id = atoi(jidbuf);
+    int chunk_id = atoi(sep + 1);
 
-    long chunk_id = strtol(idx_text, nullptr, 10);
-    imgTxLogf("[IMG_TX] request chunk=%ld from=%s",
-              chunk_id,
+    int effective_job_id = req_job_id;
+    if (req_job_id < 0) {
+      // job_id=-1 means create a new capture/job and send first chunk.
+      int new_job_id = findNextJobIdOnSd();
+      char job_img_path[64];
+      snprintf(job_img_path, sizeof(job_img_path), "/imgtx/%d.jpg", new_job_id);
+      if (!captureImageToJobFile(job_img_path)) {
+        snprintf(reply_text, reply_text_len, "capture failed");
+        return true;
+      }
+      if (!loadJobJpgToBuffer(job_img_path)) {
+        snprintf(reply_text, reply_text_len, "load failed");
+        return true;
+      }
+      image_job_id_ = new_job_id;
+      effective_job_id = new_job_id;
+      chunk_id = 0;
+      imgTxLogf("[IMG_TX] new capture job_id=%d", effective_job_id);
+    } else {
+      if (last_aborted_job_id_ >= 0 && req_job_id == last_aborted_job_id_) {
+        imgTxLogf("[IMG_TX] ignoring chunk request for aborted job_id=%d", req_job_id);
+        snprintf(reply_text, reply_text_len, "job aborted");
+        return true;
+      }
+      if (image_job_id_ != req_job_id) {
+        char job_img_path[64];
+        snprintf(job_img_path, sizeof(job_img_path), "/imgtx/%d.jpg", req_job_id);
+        if (!loadJobJpgToBuffer(job_img_path)) {
+          snprintf(reply_text, reply_text_len, "job not found");
+          return true;
+        }
+        image_job_id_ = req_job_id;
+      }
+      effective_job_id = req_job_id;
+    }
+
+    if (last_aborted_job_id_ >= 0 && effective_job_id == last_aborted_job_id_) {
+      imgTxLogf("[IMG_TX] ignoring chunk request for aborted job_id=%d", effective_job_id);
+      snprintf(reply_text, reply_text_len, "job aborted");
+      return true;
+    }
+    imgTxLogf("[IMG_TX] request chunk=%d job_id=%d from=%s", chunk_id, effective_job_id,
               sender_name != nullptr && sender_name[0] != 0 ? sender_name : "(unknown)");
-    bool sent = sendChunkByIndex(mesh, (int)chunk_id, sender_name);
+    bool sent = sendChunkByIndex(mesh, chunk_id, sender_name);
     if (!sent) {
-      snprintf(reply_text, reply_text_len, "capture chunk %ld failed", chunk_id);
+      snprintf(reply_text, reply_text_len, "capture chunk %d failed", chunk_id);
     }
     return true;
   }
 
   if (strcmp(command, "!capture") == 0) {
-    imgTxLogf("[IMG_TX] request chunk=0 from=%s",
+    // Bare !capture behaves as !capture|-1|0 (new capture).
+    int new_job_id = findNextJobIdOnSd();
+    char job_img_path[64];
+    snprintf(job_img_path, sizeof(job_img_path), "/imgtx/%d.jpg", new_job_id);
+    if (!captureImageToJobFile(job_img_path)) {
+      snprintf(reply_text, reply_text_len, "capture failed");
+      return true;
+    }
+    if (!loadJobJpgToBuffer(job_img_path)) {
+      snprintf(reply_text, reply_text_len, "load failed");
+      return true;
+    }
+    image_job_id_ = new_job_id;
+    imgTxLogf("[IMG_TX] bootstrap !capture new job_id=%d from=%s", image_job_id_,
               sender_name != nullptr && sender_name[0] != 0 ? sender_name : "(unknown)");
     bool sent = sendChunkByIndex(mesh, 0, sender_name);
     if (!sent) {
@@ -393,13 +474,19 @@ bool MeshcoreImageTransfer::handleDirectMessage(MyMesh& mesh, const char* text, 
     return true;
   }
 
-  if (strcmp(command, "!abort") == 0) {
+  if (strncmp(command, "!abort", 6) == 0) {
+    // Abort always targets the current active job on companion.
+    int aborted_job_id = image_job_id_;
     freeImageBuffer();
-#if defined(ESP32_S3_N16R8_SX1262)
-    SD_MMC.remove(kCurrentImagePath);
-#endif
+    if (aborted_job_id >= 0) {
+      last_aborted_job_id_ = aborted_job_id;
+      imgTxLogf("[IMG_TX] abort: set last_aborted_job_id_=%d", last_aborted_job_id_);
+    } else {
+      imgTxLogf("[IMG_TX] abort: no active job, last_aborted_job_id_ unchanged (%d)", last_aborted_job_id_);
+    }
+    // Do not remove any images on abort; preserve all job_id.jpg files.
     snprintf(reply_text, reply_text_len, "abort done");
-    imgTxLogf("[IMG_TX] abort: cleared buffer and deleted %s", kCurrentImagePath);
+    imgTxLogf("[IMG_TX] abort: cleared buffer, all images preserved");
     return true;
   }
 
@@ -408,10 +495,15 @@ bool MeshcoreImageTransfer::handleDirectMessage(MyMesh& mesh, const char* text, 
 
 bool MeshcoreImageTransfer::abort(MyMesh& mesh) {
   (void)mesh;
+  // Mark current job as aborted so future chunk requests are ignored.
+  if (image_job_id_ >= 0) {
+    last_aborted_job_id_ = image_job_id_;
+    imgTxLogf("[IMG_TX] abort api: set last_aborted_job_id_=%d", last_aborted_job_id_);
+  } else {
+    imgTxLogf("[IMG_TX] abort api: no active job, last_aborted_job_id_ unchanged");
+  }
   freeImageBuffer();
-#if defined(ESP32_S3_N16R8_SX1262)
-  SD_MMC.remove(kCurrentImagePath);
-#endif
-  imgTxLogf("[IMG_TX] abort api: cleared buffer and deleted %s", kCurrentImagePath);
+  // Do not remove any images on abort; preserve all job_id.jpg files.
+  imgTxLogf("[IMG_TX] abort api: cleared buffer, all images preserved");
   return true;
 }
