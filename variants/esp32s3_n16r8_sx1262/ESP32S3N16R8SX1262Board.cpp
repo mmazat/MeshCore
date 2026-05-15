@@ -43,16 +43,27 @@ bool init_camera() {
   config.pin_reset = CAM_PIN_RESET;
   config.xclk_freq_hz = CAM_XCLK_FREQ_HZ;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size = FRAMESIZE_VGA;
+  // The OV2640 JPEG DSP must be initialised at UXGA (its native full
+  // resolution) before being switched to a smaller capture size.
+  // Initialising directly at VGA or smaller scrambles JPEG output because
+  // the internal quantisation tables are not set up correctly.
+  // This matches the Espressif CameraWebServer reference example.
+  config.frame_size = FRAMESIZE_UXGA;
   config.jpeg_quality = CAM_JPEG_QUALITY;
-  config.fb_count = CAM_FB_COUNT;
+  config.fb_count = 1;
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
-  config.fb_location = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
+  config.fb_location = CAMERA_FB_IN_PSRAM;
 
   if (psramFound()) {
     config.jpeg_quality = CAM_JPEG_QUALITY <= 10 ? CAM_JPEG_QUALITY : 10;
-    config.fb_count = CAM_FB_COUNT >= 2 ? CAM_FB_COUNT : 2;
-    config.grab_mode = CAMERA_GRAB_LATEST;
+    // Single buffer + GRAB_WHEN_EMPTY is safest for single-shot capture:
+    // no DMA can overwrite the buffer while we hold it via fb_get().
+    config.fb_count = 1;
+    config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+  } else {
+    // Without PSRAM: drop to SVGA so the JPEG frame fits in DRAM.
+    config.frame_size = FRAMESIZE_SVGA;
+    config.fb_location = CAMERA_FB_IN_DRAM;
   }
 
   esp_err_t err = esp_camera_init(&config);
@@ -61,14 +72,21 @@ bool init_camera() {
     return false;
   }
 
-
+  // Switch to desired capture resolution now that the JPEG DSP is initialised.
   sensor_t* sensor = esp_camera_sensor_get();
   if (sensor) {
-    if (sensor->set_framesize(sensor, FRAMESIZE_VGA) != ESP_OK) {
-      Serial.println("camera framesize switch to VGA failed");
+    sensor->set_framesize(sensor, FRAMESIZE_VGA);
+  }
+
+  // Discard frames so AEC/AWB settles and the frame-size switch pipeline flushes.
+  for (int i = 0; i < 5; i++) {
+    camera_fb_t* warmup = esp_camera_fb_get();
+    if (warmup) {
+      esp_camera_fb_return(warmup);
     }
   }
 
+  Serial.println("camera init OK (UXGA DSP init -> VGA capture)");
   return true;
 }
 
@@ -143,9 +161,43 @@ bool ESP32S3N16R8SX1262Board::captureToSD(char* path_buffer, size_t path_buffer_
     return false;
   }
 
+  // Discard any frame that was buffered while the camera was idle so we always
+  // capture a fresh frame with correct exposure and white balance.
+  {
+    camera_fb_t* stale = esp_camera_fb_get();
+    if (stale) {
+      esp_camera_fb_return(stale);
+    }
+  }
+
   camera_fb_t* frame = esp_camera_fb_get();
   if (frame == nullptr) {
     Serial.println("camera capture failed");
+    unmountSD();
+    return false;
+  }
+
+  // Verify the sensor returned a JPEG frame. If it returns a raw format
+  // (YUV/RGB) and we write it as .jpg the file will appear scrambled.
+  if (frame->format != PIXFORMAT_JPEG) {
+    Serial.printf("capture: unexpected pixel format %d (expected JPEG)\n", (int)frame->format);
+    esp_camera_fb_return(frame);
+    path_buffer[0] = 0;
+    unmountSD();
+    return false;
+  }
+
+  // Check JPEG integrity markers before writing to SD.
+  // SOI = FF D8 at start, EOI = FF D9 at end.
+  bool has_soi = (frame->len >= 2 && frame->buf[0] == 0xFF && frame->buf[1] == 0xD8);
+  bool has_eoi = (frame->len >= 2 && frame->buf[frame->len - 2] == 0xFF && frame->buf[frame->len - 1] == 0xD9);
+  Serial.printf("capture: %ux%u %u bytes SOI=%d EOI=%d\n",
+                frame->width, frame->height,
+                static_cast<unsigned>(frame->len), has_soi, has_eoi);
+  if (!has_soi) {
+    Serial.println("capture: JPEG missing SOI marker — frame is corrupt from camera");
+    esp_camera_fb_return(frame);
+    path_buffer[0] = 0;
     unmountSD();
     return false;
   }
@@ -169,22 +221,48 @@ bool ESP32S3N16R8SX1262Board::captureToSD(char* path_buffer, size_t path_buffer_
     *out_height = frame->height;
   }
 
-  size_t written = image.write(frame->buf, frame->len);
+  // Save frame metadata before fb_return — accessing frame-> after return
+  // is use-after-free because DMA may reclaim the buffer immediately.
+  const size_t frame_len = frame->len;
+
+  size_t written = image.write(frame->buf, frame_len);
   image.flush();
   image.close();
   esp_camera_fb_return(frame);
+  frame = nullptr;  // prevent accidental reuse
 
   if (bytes_written != nullptr) {
     *bytes_written = written;
   }
 
-  if (written != frame->len) {
+  if (written != frame_len) {
     Serial.printf("capture write failed: %s (%u/%u)\n", path_buffer,
-                  static_cast<unsigned>(written), static_cast<unsigned>(frame->len));
+                  static_cast<unsigned>(written), static_cast<unsigned>(frame_len));
     SD_MMC.remove(path_buffer);
     path_buffer[0] = 0;
     unmountSD();
     return false;
+  }
+
+  // Read back and verify the file matches what we wrote (catch SD corruption).
+  File verify = SD_MMC.open(path_buffer, FILE_READ);
+  if (verify) {
+    size_t file_size = verify.size();
+    bool size_ok = (file_size == frame_len);
+    // Check first 2 bytes are JPEG SOI
+    uint8_t hdr[2] = {0, 0};
+    verify.read(hdr, 2);
+    bool file_soi = (hdr[0] == 0xFF && hdr[1] == 0xD8);
+    verify.close();
+    if (!size_ok || !file_soi) {
+      Serial.printf("capture verify FAILED: %s (file=%u expected=%u SOI=%d)\n",
+                    path_buffer, static_cast<unsigned>(file_size),
+                    static_cast<unsigned>(frame_len), file_soi);
+      SD_MMC.remove(path_buffer);
+      path_buffer[0] = 0;
+      unmountSD();
+      return false;
+    }
   }
 
   Serial.printf("capture saved: %s (%u bytes)\n", path_buffer, static_cast<unsigned>(written));
