@@ -66,9 +66,18 @@ bool init_camera() {
     config.fb_location = CAMERA_FB_IN_DRAM;
   }
 
+  // Deinit first to release any previously allocated GDMA channels or
+  // peripheral state from a prior (possibly failed) init call.
+  esp_camera_deinit();
+
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.printf("camera init failed: 0x%x\n", err);
+    // Deinit after failure so the partially-allocated GDMA channel is released.
+    // Without this, esp_camera_init's own cleanup path logs:
+    //   gdma_disconnect: no peripheral is connected to the channel
+    // and leaves the GDMA controller in a dirty state.
+    esp_camera_deinit();
     return false;
   }
 
@@ -97,10 +106,24 @@ bool init_sd() {
     return false;
   }
 
-  bool mounted = SD_MMC.begin("/sdcard", true);
+  // Always end first so the SDMMC host is in a clean state before begin().
+  // Skipping this causes ESP_ERR_TIMEOUT (0x107) on any retry because the
+  // host peripheral is left partially initialised from the previous attempt.
+  SD_MMC.end();
+
+  // First attempt at default speed.
+  bool mounted = SD_MMC.begin("/sdcard", true /* 1-bit mode */);
   if (!mounted) {
-    Serial.println("sd init failed");
-    return false;
+    // Some SD cards reject the default ~40 MHz SDMMC clock. Retry once at
+    // 20 MHz (SDMMC_FREQ_HIGHSPEED / 2) before giving up.
+    SD_MMC.end();
+    delay(50);
+    mounted = SD_MMC.begin("/sdcard", true /* 1-bit mode */, false /* format_if_failed */, SDMMC_FREQ_DEFAULT);
+    if (!mounted) {
+      Serial.println("sd init failed");
+      return false;
+    }
+    Serial.println("sd init OK at reduced speed");
   }
 
   uint8_t card_type = SD_MMC.cardType();
@@ -122,6 +145,8 @@ bool ESP32S3N16R8SX1262Board::mountSD() {
     return true;
   }
 
+  // Ensure any previous partial init is cleaned up before retrying.
+  SD_MMC.end();
   sd_online = init_sd();
   sd_mounted = sd_online;
   return sd_online;
@@ -135,8 +160,13 @@ void ESP32S3N16R8SX1262Board::unmountSD() {
 
 void ESP32S3N16R8SX1262Board::begin() {
   ESP32Board::begin();
-  camera_online = init_camera();
+  // Initialize SD before camera: esp_camera_init() failure leaves the shared
+  // ESP32-S3 GDMA controller in a dirty state (gdma_disconnect on an
+  // unconnected channel). SDMMC also uses GDMA, so if camera runs first and
+  // fails, SD init gets ESP_ERR_TIMEOUT (0x107) because it can't claim a DMA
+  // channel. Mounting SD first avoids this race entirely.
   sd_online = mountSD();
+  camera_online = init_camera();
   // SD card remains mounted for the entire runtime
 }
 
