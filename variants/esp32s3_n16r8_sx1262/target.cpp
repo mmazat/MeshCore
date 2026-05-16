@@ -17,7 +17,9 @@ SensorManager sensors;
 
 bool radio_init() {
   fallback_clock.begin();
-  rtc_clock.begin(Wire);
+  // rtc_clock.begin(Wire);
+  // No external RTC on this board — skip I2C probing to avoid Wire NACK errors.
+  // AutoDiscoverRTCClock falls through to ESP32RTCClock fallback automatically.
 
   return radio.std_init(&spi);
 }
